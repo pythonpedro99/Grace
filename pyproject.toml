@@ -1,0 +1,19 @@
+[project]
+name = "sfn"
+version = "0.4.0"
+description = "SFN-World: not-yet-learned vs. unlearnable features in SIGReg world models"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy", "pandas", "matplotlib"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools]
+packages = ["sfn"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N"]
+ignore = ["N803", "N806", "N812"]  # capitalised tensors (D, G, W, U, V) follow the PDF; F is torch's convention
