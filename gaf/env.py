@@ -1,0 +1,134 @@
+"""Clip world: low-res RGB clips of T frames built from four kinds of content.
+
+    slow   n_slow smooth colour patterns, amplitudes follow an OU process (rho close to 1).
+           Gaussian across clips, so they alone can satisfy SIGReg while being trivially
+           predictable: the shortcut the encoder can collapse onto.
+    fast   a sprite moving with constant velocity per clip, wrapping around (torus).
+           Deterministic; needs both context frames (p2 = 2 p1 - p0).
+    hard   a sprite on a chaotic circle map q' = k q + c (mod 1), c per clip.
+           Deterministic but harder to learn (q2 = (k+1) q1 - k q0, a higher-degree map).
+    noise  n_noise patterns of the same kind as slow, resampled every frame. Unpredictable:
+           the only content that should be dropped.
+
+Frames 0..T-2 are context, frame T-1 is the target. The pattern bases (slow and noise
+together) are orthonormal in pixel space, so every pattern factor is linearly decodable.
+"""
+import math
+from dataclasses import dataclass
+from typing import NamedTuple
+
+import torch
+
+GROUPS = ("slow", "fast", "hard", "noise")
+
+
+@dataclass(frozen=True)
+class EnvCfg:
+    res: int = 32  # image side, must be divisible by 8
+    T: int = 3  # frames per clip; the last one is the target
+    n_slow: int = 16
+    slow_rho: float = 0.98  # per-frame OU coefficient of the slow amplitudes
+    n_noise: int = 8
+    v_max: float = 0.12  # fast sprite speed per axis, in image widths per frame
+    hard_k: int = 2  # hard sprite map multiplier (2 = doubling map, higher = harder)
+    sprite_sigma: float = 0.06  # sprite radius in image widths
+    a_slow: float = 1.0  # pixel RMS of the slow part
+    a_noise: float = 1.0  # pixel RMS of the noise part
+    a_fast: float = 4.0  # sprite peak brightness (fast: white, hard: red)
+    a_hard: float = 4.0
+    pixel_noise: float = 0.05
+    max_freq: int = 3  # highest spatial frequency of the patterns
+    seed: int = 0  # fixes the patterns and sprite colours
+
+
+class Clip(NamedTuple):
+    x: torch.Tensor  # (n, T, 3, res, res)
+    f: dict  # group -> (n, T, d_group) ground-truth factors per frame
+    v: torch.Tensor  # (n, 2) fast-sprite velocity
+    c: torch.Tensor  # (n, 2) hard-sprite offset
+
+
+def _emb(p: torch.Tensor) -> torch.Tensor:
+    """(..., 2) positions on the torus -> (..., 4) = cos, sin of each coordinate."""
+    a = 2 * math.pi * p
+    return torch.stack([a.cos(), a.sin()], -1).flatten(-2)
+
+
+def _patterns(n: int, res: int, max_freq: int, gen: torch.Generator, modes: int = 6):
+    """n smooth random colour fields: sums of low-frequency Fourier modes with random colours."""
+    g = torch.arange(res) / res
+    yy, xx = torch.meshgrid(g, g, indexing="ij")
+    fx = torch.randint(-max_freq, max_freq + 1, (n, modes), generator=gen).float()
+    fy = torch.randint(-max_freq, max_freq + 1, (n, modes), generator=gen).float()
+    ph = 2 * math.pi * torch.rand(n, modes, generator=gen)
+    col = torch.randn(n, modes, 3, generator=gen)
+    wave = torch.cos(2 * math.pi * (fx[..., None, None] * xx + fy[..., None, None] * yy)
+                     + ph[..., None, None])
+    return torch.einsum("nmc,nmhw->nchw", col, wave)
+
+
+def _bump(p: torch.Tensor, res: int, sigma: float) -> torch.Tensor:
+    """Periodic Gaussian sprite. p: (..., 2) = (x, y) in [0, 1) -> (..., res, res)."""
+    g = (torch.arange(res, device=p.device) + 0.5) / res
+    d = (g - p[..., None] + 0.5) % 1 - 0.5  # (..., 2, res)
+    b = torch.exp(-(d**2) / (2 * sigma**2))
+    return b[..., 1, :, None] * b[..., 0, None, :]
+
+
+class ClipEnv:
+    """Samples i.i.d. clips on `device`. Uses the global torch RNG (seed it per run)."""
+
+    def __init__(self, cfg: EnvCfg = EnvCfg(), device="cpu"):
+        assert cfg.res % 8 == 0 and cfg.T >= 2
+        self.cfg, self.dev = cfg, device
+        gen = torch.Generator().manual_seed(cfg.seed)
+        n = cfg.n_slow + cfg.n_noise
+        P = _patterns(n, cfg.res, cfg.max_freq, gen).flatten(1)  # (n, 3 res^2)
+        Q = torch.linalg.qr(P.T)[0].T  # orthonormal rows, still smooth
+        npix = Q.shape[1]
+        # each group gets pixel RMS a: per-factor scale a * sqrt(npix / n_group)
+        self.B_slow = (Q[: cfg.n_slow] * cfg.a_slow * math.sqrt(npix / cfg.n_slow)).to(device)
+        self.B_noise = (Q[cfg.n_slow:] * cfg.a_noise * math.sqrt(npix / max(cfg.n_noise, 1))
+                        ).to(device)
+        self.Q = Q.to(device)  # unit-norm bases, used by the oracle encoder in tests
+        cols = torch.tensor([[1.0, 1.0, 1.0], [1.0, -0.6, -0.6]])  # fast: white, hard: red
+        self.col_fast, self.col_hard = (cols / cols.norm(dim=1, keepdim=True) * math.sqrt(3)
+                                        ).to(device)
+        self.dims = {"slow": cfg.n_slow, "fast": 4, "hard": 4, "noise": cfg.n_noise}
+
+    @torch.no_grad()
+    def sample(self, n: int) -> Clip:
+        c, dev, T = self.cfg, self.dev, self.cfg.T
+        s = [torch.randn(n, c.n_slow, device=dev)]
+        for _ in range(T - 1):
+            s.append(c.slow_rho * s[-1] + math.sqrt(1 - c.slow_rho**2)
+                     * torch.randn(n, c.n_slow, device=dev))
+        s = torch.stack(s, 1)  # (n, T, n_slow)
+        noise = torch.randn(n, T, c.n_noise, device=dev)
+        v = (2 * torch.rand(n, 2, device=dev) - 1) * c.v_max
+        p = [torch.rand(n, 2, device=dev)]
+        cc = torch.rand(n, 2, device=dev)
+        q = [torch.rand(n, 2, device=dev)]
+        for _ in range(T - 1):
+            p.append((p[-1] + v) % 1)
+            q.append((c.hard_k * q[-1] + cc) % 1)
+        p, q = torch.stack(p, 1), torch.stack(q, 1)  # (n, T, 2)
+
+        x = s @ self.B_slow + noise @ self.B_noise  # (n, T, 3 res^2)
+        x = x.view(n, T, 3, c.res, c.res)
+        for a, col, pos in ((c.a_fast, self.col_fast, p), (c.a_hard, self.col_hard, q)):
+            x = x + a * col[:, None, None] * _bump(pos, c.res, c.sprite_sigma)[:, :, None]
+        x = x + c.pixel_noise * torch.randn_like(x)
+        f = {"slow": s, "fast": _emb(p), "hard": _emb(q), "noise": noise}
+        return Clip(x, f, v, cc)
+
+    def factors(self, clip: Clip, t: int = -1) -> torch.Tensor:
+        """All groups at frame t, concatenated in GROUPS order: (n, sum of dims)."""
+        return torch.cat([clip.f[g][:, t] for g in GROUPS], -1)
+
+    def group_cols(self) -> dict:
+        out, i = {}, 0
+        for g in GROUPS:
+            out[g] = slice(i, i + self.dims[g])
+            i += self.dims[g]
+        return out

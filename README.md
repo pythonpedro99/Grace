@@ -1,155 +1,122 @@
-# SFN-World: not yet learned vs. unlearnable
+# Gain attribution with floor check
 
-A fast synthetic test of how to stop a SIGReg world model (LeWM-style JEPA) from throwing away
-features that are **hard to learn but perfectly predictable**, while still discarding real noise.
-Spec: `SFN-World experiment draft v0.4 ... .pdf`. Build notes and interpretations: [plan.md](plan.md).
+A small, fast test bed for one question. When a predictive world model with a shared encoder and
+SIGReg collapses onto slow features, does the gain-attribution fix stop that while still letting the
+encoder discard real noise? The fix: the encoder may simplify the target latent only in directions where
+the predictor has stopped improving and sits near its achievable error floor.
 
-## The problem in one minute
+Spec: `docs/gain_attribution_one_pager.pdf` (section numbers below refer to it). Design decisions
+where the one-pager is silent: [plan.md](plan.md).
 
-A SIGReg world model has an encoder `z = enc(x)`, a predictor `P(z_t, a_t) ≈ z_{t+1}`, and the loss
+## The problem in one paragraph
 
-    L = ‖P(z_t, a_t) − z_{t+1}‖² + λ · SIGReg(z)
+SIGReg checks only batch statistics. Slow features vary strongly between clips, so they satisfy
+SIGReg while being trivially predictable, and the encoder can collapse onto them. Stop-grad on the
+target does not prevent this. The encoder is shared, so a context-path update also moves the target
+`z_t = f(x_t; θ)`. If that makes `z_t` easier to predict, the loss drops through a route that no
+gradient accounted for: the **leak**.
 
-SIGReg pushes `z` toward an isotropic Gaussian. That fixes *how much* variance the latent has, so it
-cannot collapse, but not *which* information fills it.
+## The environment (`gaf/env.py`)
 
-The failure we want to understand:
+RGB clips, 32×32, `T = 3` frames: two context frames and one target. Four kinds of content:
 
-1. The encoder also gets gradient through the **target** `z_{t+1}`: it is rewarded for making the
-   target easier to hit. That route destroys information.
-2. A fast, action-dependent feature (say a rotation angle) has a large prediction error early on,
-   because the predictor has not learned it yet. The cheapest way to lower the loss is to **delete it
-   from `z`**, before the predictor ever gets the chance. A slow or easy feature never has this problem.
-3. SIGReg then refills the freed variance with something else, typically redundant nonlinear copies of the
-   slow features.
+| Group | What | Dynamics | Should the latent keep it? |
+|-------|------|----------|----------------------------|
+| **slow** | 16 smooth colour patterns | OU, ρ = 0.98; Gaussian across clips | yes (trivially predictable) |
+| **fast** | white sprite, constant velocity per clip, wraps around | `p₂ = 2p₁ − p₀`: deterministic, needs both context frames | yes |
+| **hard** | red sprite on a chaotic circle map `q' = k q + c (mod 1)` | `q₂ = (k+1) q₁ − k q₀`: deterministic, slower to learn | yes |
+| **noise** | 8 patterns like the slow ones | fresh every frame | **no**: the only content to drop |
 
-So there is a race between *the predictor learning a feature* and *the encoder deleting it*.
+Slow and noise patterns share one orthonormal pixel basis. Both are equally easy to *read* from
+an image, and only their dynamics differ. With `n_slow ≥ D` the slow factors alone are an isotropic
+Gaussian of size D, so SIGReg can be satisfied without any other content. That is the premise of the
+failure, and the notebook checks it (`premise()`).
 
-The question: can the loss tell **epistemic** error (learnable, not learned yet: keep) from
-**aleatoric** error (irreducible: may drop), and does any intervention keep the first while still
-discarding the second?
+Knobs: `n_slow`, `slow_rho`, `n_noise`, `v_max`, `hard_k` (difficulty), `a_*` (salience),
+`pixel_noise`, `res`, `T`.
 
-> **Premise.** The failure only exists if slow features can fill SIGReg's variance budget. If they
-> cannot, SIGReg forces the fast features into the latent and the baseline looks healthy, which would be a false
-> negative. The notebook checks this after Stage 0 (`premise_check`: slow groups 1-3 must carry more
-> variance than fast-hard groups 5-7).
+## Arms (`gaf/train.py`)
 
-## The test bed (SFN-World v2)
+Encoder gradient pieces (§2): `g_ctx` (context path), `g_tgt,S` (target path on the still-learning
+set S; a measuring stick only), `g_open` (target path on saturated directions), `g_SIG` (never
+projected).
 
-Eight groups of 2 latent dims, mixed into R⁶⁴ by a frozen random MLP. Each group isolates one property:
+| Arm | Context path | Target path | Role |
+|-----|--------------|-------------|------|
+| `lewm` | `g_ctx` | all directions | baseline: full gradient (LeWM) |
+| `sg` | `g_ctx` | none | baseline: stop-grad, the leak is unchecked |
+| `ema` | `g_ctx` | EMA encoder | baseline: BYOL / I-JEPA style target |
+| `detached` | none | none | encoder sees only SIGReg: measures noise floors |
+| `target` | `g_ctx` | `g_open` | fix, target side only |
+| `context` | `g′_ctx` (projected) | none | fix, context side only |
+| `both` | `g′_ctx` | `g_open` | the full method (§7) |
 
-| # | Group | Timescale | Predictable (R²max) | Learn time | Tests |
-|---|-------|-----------|---------------------|------------|-------|
-| 1 | slow OU | slow | 0.96 | easy | classic slow-feature sanity |
-| 2 | medium OU | medium | 0.49 | easy | same |
-| 3 | slow + random jumps | slow | 0.90 | easy | are rare surprises thrown out with the noise? |
-| 4 | rotation, no action | fast | 1.0 | easy | control for 5 |
-| 5 | rotation driven by action | fast | 1.0 | **hard** | **the key group**: same as 4 but slower to learn |
-| 6 | as 5 plus angle noise | fast | 0.5 | hard | half aleatoric: is a gate calibrated? |
-| 7 | slower rotation | medium | 1.0 | medium-hard | timescale vs. 5 |
-| 8 | i.i.d. noise | none | 0 | never | the only thing that *should* be dropped |
+Every arm runs the same gate and diagnostics, so the leak can be compared across arms.
 
-The ideal outcome is to keep groups 1-7 and drop only group 8. **Group 4 vs. group 5** is the most
-important comparison: same timescale and predictability, different learning time.
+## The method
 
-Knobs: latent size `D` (16 tight, 24 middle, 48 roomy), difficulty `D0/D1/D2` (makes groups 5-7 harder
-to learn), and fast-feature salience `w_fast`.
+- **Floor L\*_j (§3), `gate.floor_probe`:** every `floor_every` steps, freeze a snapshot of the
+  encoder, encode 16k fresh clips, and train a fresh predictor (same architecture) for
+  `floor_steps`. L\*_j is its held-out per-direction error. To counter probe bias, the floor used is
+  the minimum over the last `floor_keep` refreshes, times `(1 − floor_margin)`.
+- **Gate (§4), `gate.FloorGate`:** relative gap `EMA_W[L_j(P̄) − L_j(P)] / (L̄_j + δ)`, and
+  excess `e_j = (L̄_j − L*_j) / (L*_j + δ)`. A direction enters S when the gap exceeds `eps_g` or the
+  excess exceeds `eps_f`, and leaves only when both are below half of their threshold and
+  `min_dwell` steps have passed. Before the first floor exists, everything is in S.
+- **Projection (§6), `grads.project`:** `ℓ = g_tgt,S · M g_ctx`. If `ℓ > 0`, then
+  `g′_ctx = g_ctx − α ℓ / (g_tgt,S · M g_tgt,S) · g_tgt,S`. `M` is Adam's diagonal preconditioner, so
+  the leak of the *actual* Adam step is removed (`precond=False` uses M = I, `opt="sgd"` is the exact
+  case).
+- **Directions:** latent dims (`basis="dim"`), or the eigenbasis of the floor probe's residual
+  covariance (`basis="resid"`), which sorts directions from noisy to predictable. The running state is
+  rotated into each new basis.
 
-## Two knobs: the target path and the SIGReg budget
+## Probing suite and diagnostics (`gaf/probes.py`, §9)
 
-Every arm is a pair `(G, B)`. The context path (`z_t` made informative) is identical in all arms.
-
-    x_t ──enc──► z_t ─────────────┐
-                                  ├─► predictor ─► ẑ_{t+1} ─┐
-    x_{t+1} ─enc─► z_{t+1} ─[G]──► target ───────────────────┴─► prediction loss
-                   z_t, z_{t+1} ──[SIGReg, slices weighted by B]──► regulariser
-
-`G` is a D×D matrix on the target path's *gradient* (forward value unchanged):
-`target = sg(z') + (z' − sg(z')) @ G`. `G = I` is LeWM, `G = 0` is stop-grad.
-
-### Knob G: target-path arms
-
-| Arm | Idea |
-|-----|------|
-| **A0** | LeWM baseline, `G = I`. Predicted to drop group 5 and keep 4. |
-| **A1** | Stop-grad, `G = αI`. Removes the deleting route, and the compression pressure with it. |
-| **A2** | EMA target encoder (`G = 0` plus a lagged encoder). Same idea, BYOL-style. |
-| **M1a-d** | **Learning-progress gates.** Compare the predictor with a slow EMA copy of itself on the *same* features. If it is improving on a direction, the error is epistemic: protect it (`g → 0`). If it is stuck, let the encoder compress (`g → 1`). They differ only in the *basis* used: |
-| M1a | per latent dimension (basis-dependent, since SIGReg makes the latent rotation-invariant) |
-| M1b | fresh random projections each step (basis-free) |
-| M1c | naive loss slope on a fixed bank (confound check: it can't tell the predictor learning from the encoder shrinking the direction) |
-| M1d | eigenbasis of the EMA residual covariance (a data-defined, slowly refreshed basis) |
-| **M2** | Ensemble disagreement: heads that disagree relative to their error mean epistemic uncertainty. |
-| **M3** | Heteroscedastic head. Pre-registered to **fail**: the variance head absorbs epistemic error too. |
-| **C1** | Control: predictor lr ×5. Is a faster predictor enough? |
-| **C2** | Control: stop-grad for the first 2k steps only. Is a head start enough? |
-| **C3** | Oracle: supervised aux loss on groups 1-7. Upper bound. |
-
-If C1 or C2 matches the gated arms, the machinery is unnecessary. All M1 arms use C2's 2k-step
-warm-up, because at a plateau every learning-progress signal reads zero.
-
-### Knob B: SIGReg budget
-
-Idea: when the budget is tight, directions that are *trivially* predictable (slow, linear, easy) hog it.
-A deliberately weak **linear** predictor flags those directions with a shortcut score `s`; SIGReg is then
-relaxed on them (per-slice weight `max(0.2, 1 − Σ s_k (w·v_k)²)`), freeing room for the hard features.
-The flag is never used as a target gate.
-
-| Level | What it does |
-|-------|--------------|
-| **B0** | LeWM SIGReg. All Stage 1 target arms run here. |
-| **B1** | SIGReg relaxed on flagged directions. |
-| **B2** | B1 plus a small shrink penalty on the flagged directions' variance. |
-| **B-rand** | B1's relaxation on a *random* subspace. Control: if it matches B1, the gain is just weaker SIGReg, not targeting. |
-
-Arms are written `M1d+B1`; no suffix means B0. Arms with the same B differ only in the target path,
-and arms with the same G differ only in the budget, so each effect is attributable.
-
-## What counts as success
-
-- **Gate:** R²₅ and R²₆ each ≥ 0.3 above A0 and ≥ 0.1 above the best of A1/A2/C1/C2; R²₈ ≤ A0 + 0.1; no
-  group in 1-4 loses more than 0.1; holds over 3 seeds and at D1.
-- **Factor B:** M1d+B beats M1d by ≥ 0.1 on R²₅ or R²₆, M1d+B-rand does not, and the same side conditions hold.
-
-`gate_verdict()` and `budget_verdict()` in `sfn/stages.py` compute these on seed means.
-
-## Protocol
-
-| Stage | What | Runs |
-|-------|------|------|
-| 0b | predictor on ground truth (no encoder): learn time `t90`, `R²_lin`. Needs `t90(5) ≥ 3·t90(4)` | 9 (seconds each) |
-| 0 | reproduce the failure with A0 over λ × `w_fast`; calibrate M2's β; **premise check** | 12 |
-| 1 | the 13 target arms at B0, D = 16 | 39 |
-| 1-B | A0+B1, M1d+B1, M1d+B2, M1d+B-rand | 12 |
-| 1b | capacity: D = 48 | 15 |
-| 1c | D = 24, only if B showed no effect at D = 16 | 9 (conditional) |
-| 2 | difficulty sweep D1, D2 | 30 |
-| 2-B | best G+B at D1, D2, only if B passed | 6 (conditional) |
-
-Findings so far: with a clean ground-truth state, group 5 is *not* slower to learn than group 4 at D0,
-so the notebook defaults to D1 (the lowest difficulty that passes the check).
+- **Representation:** ridge R² of every group at the target frame from `z_t` (`r2_*`), from the
+  prediction (`pred_r2_*`), and from a final MLP probe (`mlp_r2_*`). Also each group's share of
+  `tr Cov(z)` (`vs_*`), and per-direction content (D × groups).
+- **Slow-feature drift:** the within/between-clip variance ratio (`wb_ratio`) and the effective rank
+  of `z_t − z_{t−1}` (`rank_dz`).
+- **Leak:** share of steps with `ℓ > 0` (`leak_pos`), `cos(g_tgt,S, M g_ctx)` (`leak_cos`), and
+  `‖g′_ctx‖/‖g_ctx‖` (`proj_ratio`). Per direction, the first-order leak of the applied context step
+  comes from one forward-mode JVP (`leak_jvp`). The exact check is
+  `ℓ_real = L(θ′, z_t(θ)) − L(θ′, z_t(θ′))`, summed over S and over the open directions
+  (`lreal_S`, `lreal_open`).
+- **Gate state per direction over training:** `gap`, `excess`, `L`, `Lstar`, `inS`, in `dirs.npz`.
 
 ## Run it
 
-On a RunPod A100 (PyTorch template): upload this folder, open `sfn_world.ipynb`, run top to bottom.
-Results land in `/workspace/results` (one CSV and one JSON per run; finished runs are skipped, so
-re-running a cell resumes).
+**RunPod GPU pod (PyTorch template):**
 
-Locally (CPU is enough for the tests):
+1. Upload or clone this folder to `/workspace`.
+2. Open `gain_attribution.ipynb` and run it top to bottom.
+
+Results go to `/workspace/results/<run_id>/`: `metrics.csv`, `dirs.npz`, `model.pt` and
+`summary.json`. A run whose `summary.json` exists is skipped, so re-running a cell resumes.
+
+**Locally** (CPU is enough for the tests):
 
     pip install -e ".[dev]"
-    pytest -q tests          # ~80 s; env stats, SIGReg vs. the LeWM reference, every arm, every B level
+    pytest -q tests
+
+One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'results')"`.
 
 ## Layout
 
-    sfn/env.py      SFN-World v2          sfn/gates.py   gates G, shortcut stats, slice weights
-    sfn/models.py   encoder, predictor,   sfn/probes.py  ridge/MLP probes and all metrics
-                    ensemble, SIGReg      sfn/train.py   run() and run_gt() (Stage 0b)
-    sfn/stages.py   grids, collect, verdicts, premise check      sfn/plots.py  the four key figures
+    gaf/env.py       clip world (EnvCfg, ClipEnv)
+    gaf/models.py    CNN encoder (GroupNorm, no BatchNorm), predictor, SIGReg (LeWM-verified), EMA
+    gaf/gate.py      FloorGate (gap, excess, hysteresis, basis rotation), floor_probe
+    gaf/grads.py     flat VJPs, Adam metric, leak projection
+    gaf/probes.py    ridge / MLP probes, probing suite
+    gaf/train.py     Cfg, ARMS, run(), run_gt() (learnability on ground truth), premise()
+    gaf/analysis.py  grids, collect, tables, verdicts, floors_of(), figures
+    tests/           CPU checks
+    gain_attribution.ipynb
 
-## Caveats
+## Cost
 
-- Not yet run on a GPU. Timing is unverified (about 11 ms/step on CPU); the first Stage 0 cell prints
-  seconds per run and the projected total.
-- Where the PDF is silent I chose defaults. They are listed in [plan.md](plan.md).
-- The PDF's literature rows for factor B were written from memory and not re-checked.
+A fix arm pays for one extra lagged-predictor forward pass and two extra encoder backward passes
+(`g_ctx` and `g_tgt,S` separately). The floor probe is amortised every `floor_every` steps. The
+baselines need one encoder backward pass, plus the separate passes every `diag_every` steps for the
+diagnostics.
