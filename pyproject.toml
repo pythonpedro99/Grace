@@ -3,7 +3,7 @@ name = "gaf"
 version = "0.1.0"
 description = "Gain attribution with floor check: leak-free predictive training with a shared encoder and SIGReg"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.1", "numpy", "pandas", "matplotlib"]
+dependencies = ["torch>=2.1", "numpy", "pandas", "matplotlib", "tqdm", "ipywidgets"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]

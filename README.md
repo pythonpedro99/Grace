@@ -26,11 +26,16 @@ does not. Four kinds of content:
 |-------|------|----------|----------------------------|
 | **slow** | 16 smooth colour patterns | OU, ρ = 0.98; Gaussian across clips; action-free | yes (trivially predictable) |
 | **fast** | white sprite, wraps around | `p' = p + 0.3·a`: deterministic given the action | yes |
-| **hard** | red sprite on a chaotic circle map | `q' = 2q + 0.4·a (mod 1)`: deterministic given the action, slower to learn | yes |
+| **hard** | red sprite on a chaotic circle map | `q' = 2q + 0.3·a (mod 1)`: deterministic given the action, learned after a long plateau | yes |
 | **noise** | 8 patterns like the slow ones | fresh every frame | **no**: the only content to drop |
 
 The predictable sprite content is action-conditioned. Without the action, R² of the next position is
-capped at `(sin 2πv / 2πv)²`: 0.25 for fast and 0.05 for hard. `run_gt(actions=False)` checks this.
+capped at `(sin 2πv / 2πv)²`: 0.25 for both (v = 0.3). `run_gt(actions=False)` checks this.
+
+The hard sprite is the not-yet-learned content: on ground truth, a predictor learns fast in about
+750 steps and hard in 2250–3000 (4 seeds), after a plateau at R² ≈ 0. The plateau length grows
+steeply with `h_act`: below 0.1 it is gone, and from 0.35 on hard is not learned reliably within 6000
+steps, which makes it unlearnable instead of hard to learn.
 
 Slow and noise patterns share one orthonormal pixel basis. Both are equally easy to *read* from
 an image, and only their dynamics differ.
@@ -140,6 +145,15 @@ Every arm runs the same optimizer, gate and diagnostics, so the leak can be comp
 Results go to `/workspace/results/<run_id>/`: `metrics.csv`, `dirs.npz`, `model.pt`,
 `summary.json` and `log.txt`. A run whose `summary.json` exists is skipped, so re-running a cell
 resumes.
+
+Every long cell shows a progress bar:
+- **Training stages (`execute`):** one bar over the training steps of all runs still to do, with
+  speed and ETA for the whole cell. Its status line lists each running run as
+  `<arm> s<seed> <percent> <phase>`, where the phase is `train`, `floor probe`, `eval` or
+  `final probes`. Each finished run prints its time above the bar.
+- **Ground-truth check and floor probes of finished runs:** a bar over their training steps.
+- With `WORKERS > 1` the workers report to the parent through `<run_id>/progress.json`; their eval
+  lines go to `log.txt`. With `WORKERS = 1` the eval lines are printed above the bar.
 
 `WORKERS = 3` in the notebook runs three runs at once, as separate processes on the same GPU. The
 model is small and the GPU mostly waits on kernel launches, so this is close to a 3× speed-up. Watch

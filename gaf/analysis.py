@@ -1,15 +1,16 @@
 """Run grids, result collection, tables, verdicts and figures for the notebook."""
-import contextlib
 import json
 import multiprocessing as mp
+import os
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from .env import GROUPS, ClipEnv
 from .gate import floor_probe
@@ -43,51 +44,110 @@ def _label(c: Cfg) -> str:
 
 
 def _work(cfg: Cfg, out) -> float:
-    """One run in a worker process; its progress goes to <run_id>/log.txt."""
+    """One run in a worker process. Progress goes to <run_id>/progress.json (polled by the
+    parent), the eval lines to <run_id>/log.txt."""
     torch.set_num_threads(2)  # several workers share the CPU (data sampling, small ops)
     odir = Path(out) / cfg.run_id
     odir.mkdir(parents=True, exist_ok=True)
+    pf, tmp, last = odir / "progress.json", odir / "progress.tmp", [-100, ""]
+
+    def on_step(step, phase):  # throttled: every 25 steps, and at every phase change
+        if phase != last[1] or step - last[0] >= 25:
+            tmp.write_text(json.dumps({"step": step, "phase": phase}))
+            os.replace(tmp, pf)  # atomic: the parent never reads half a file
+            last[:] = [step, phase]
+
     t = time.time()
-    with open(odir / "log.txt", "a") as f, contextlib.redirect_stdout(f):
-        run(cfg, out, verbose=True)
+    with open(odir / "log.txt", "a") as f:
+        def log(line):
+            f.write(line + "\n")
+            f.flush()
+
+        run(cfg, out, on_step=on_step, log=log)
     return time.time() - t
 
 
-def execute(cfgs, out, workers: int = 1) -> None:
-    """Run every cfg whose summary.json does not exist yet.
+def execute(cfgs, out, workers: int = 1, progress: bool = True) -> None:
+    """Run every cfg whose summary.json does not exist yet, with one progress bar.
 
-    workers=1: sequentially in this process (progress printed here). workers>1: that many runs
-    at once in separate processes on the same GPU. The model is small and launch-bound, so
-    3-4 workers give close to a proportional speed-up; per-run progress is in <run_id>/log.txt.
-    A failing run does not stop the others; the errors are raised at the end.
+    The bar counts training steps over all runs still to do (so its ETA covers the whole cell)
+    and shows what each running run is doing: "<arm> s<seed> <percent> <phase>", where the phase
+    is train / floor probe / eval / final probes.
+
+    workers=1: sequentially in this process; the eval lines are printed above the bar.
+    workers>1: that many runs at once in separate processes on the same GPU. The model is small
+    and launch-bound, so 3-4 workers give close to a proportional speed-up. The eval lines of
+    each run are in <run_id>/log.txt. A failing run does not stop the others; the errors are
+    raised at the end. progress=False: no bar (the eval lines are still printed).
     """
     todo = [c for c in cfgs if not (Path(out) / c.run_id / "summary.json").exists()]
     print(f"{len(cfgs) - len(todo)} of {len(cfgs)} runs already done, {len(todo)} to go"
           + (f" on {workers} workers" if workers > 1 and todo else ""), flush=True)
-    t0, errors = time.time(), []
-    if workers <= 1:
-        for i, c in enumerate(todo, 1):
-            t = time.time()
-            print(f"[{i}/{len(todo)}] {_label(c)}", flush=True)
-            run(c, out)
-            print(f"    finished in {time.time() - t:.0f}s", flush=True)
+    if not todo:
         return
-    ctx = mp.get_context("spawn")  # CUDA cannot be shared with forked workers
-    with ProcessPoolExecutor(workers, mp_context=ctx) as pool:
-        futs = {pool.submit(_work, c, str(out)): c for c in todo}
-        for i, fut in enumerate(as_completed(futs), 1):
-            c = futs[fut]
-            try:
-                sec = fut.result()
-                print(f"[{i}/{len(todo)}] {_label(c)} finished in {sec:.0f}s "
-                      f"(wall {time.time() - t0:.0f}s)", flush=True)
-            except Exception as e:  # noqa: BLE001
-                errors.append((c, e))
-                print(f"[{i}/{len(todo)}] {_label(c)} FAILED: {e!r} "
-                      f"(log: {Path(out) / c.run_id / 'log.txt'})", flush=True)
+    counted = {c.run_id: 0 for c in todo}  # steps of each run already added to the bar
+    bar = tqdm(total=sum(c.steps for c in todo), desc="training", unit="step", unit_scale=True,
+               disable=not progress, smoothing=0.05)
+
+    def advance(c: Cfg, step: int) -> None:
+        if step > counted[c.run_id]:
+            bar.update(step - counted[c.run_id])
+            counted[c.run_id] = step
+
+    try:
+        if workers <= 1:
+            for i, c in enumerate(todo, 1):
+                t = time.time()
+
+                def on_step(step, phase, c=c):
+                    advance(c, step)
+                    bar.set_postfix_str(f"run {i}/{len(todo)}: {c.arm} s{c.seed} {phase}",
+                                        refresh=False)
+
+                run(c, out, on_step=on_step, log=bar.write)
+                bar.write(f"[{i}/{len(todo)}] {_label(c)} finished in {time.time() - t:.0f}s")
+            return
+        errors = _execute_parallel(todo, out, workers, bar, advance)
+    finally:
+        bar.close()
     if errors:
         names = ", ".join(_label(c) for c, _ in errors)
         raise RuntimeError(f"{len(errors)} run(s) failed: {names}")
+
+
+def _execute_parallel(todo, out, workers, bar, advance) -> list:
+    for c in todo:  # a progress file left by an interrupted attempt must not count
+        (Path(out) / c.run_id / "progress.json").unlink(missing_ok=True)
+    ctx = mp.get_context("spawn")  # CUDA cannot be shared with forked workers
+    errors, finished, t0 = [], 0, time.time()
+    with ProcessPoolExecutor(workers, mp_context=ctx) as pool:
+        futs = {pool.submit(_work, c, str(out)): c for c in todo}
+        pending = set(futs)
+        while pending:
+            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            for fut in done:
+                c, finished = futs[fut], finished + 1
+                advance(c, c.steps)
+                try:
+                    sec = fut.result()
+                    bar.write(f"[{finished}/{len(todo)}] {_label(c)} finished in {sec:.0f}s "
+                              f"(wall {time.time() - t0:.0f}s)")
+                except Exception as e:  # noqa: BLE001
+                    errors.append((c, e))
+                    bar.write(f"[{finished}/{len(todo)}] {_label(c)} FAILED: {e!r} "
+                              f"(log: {Path(out) / c.run_id / 'log.txt'})")
+            status = []
+            for fut in pending:
+                c = futs[fut]
+                try:
+                    d = json.loads((Path(out) / c.run_id / "progress.json").read_text())
+                except (FileNotFoundError, ValueError):
+                    continue  # not started yet
+                advance(c, d["step"])
+                status.append(f"{c.arm} s{c.seed} {100 * d['step'] // c.steps}% {d['phase']}")
+            bar.set_postfix_str(" | ".join(status), refresh=False)
+            bar.refresh()
+    return errors
 
 
 # ---- collecting -------------------------------------------------------------------------------
@@ -164,16 +224,17 @@ def _content(enc, env, Q, n=8192):
                      for g in GROUPS], 1)
 
 
-def floors_of(cfg: Cfg, out, steps=3000, basis="excess") -> pd.DataFrame:
+def floors_of(cfg: Cfg, out, steps=3000, basis="excess", progress=True) -> pd.DataFrame:
     """Floor probe on the final encoder of a finished run, with per-direction content.
 
     One row per latent direction: floor L*_j, and the R^2 of z_j from each group.
+    progress: show a bar over the probe's training steps.
     """
     torch.manual_seed(cfg.seed + 777)
     enc, P, tgt = load_model(cfg, out)
     env = ClipEnv(cfg.env, device())
     Ls, Q, _ = floor_probe(enc, tgt, env, steps=steps, lr=cfg.lr, wd=cfg.wd, basis=basis,
-                           pred=P)
+                           pred=P, desc=f"floor probe {cfg.arm} s{cfg.seed}" if progress else None)
     c = _content(enc, env, Q)
     d = pd.DataFrame(c, columns=list(GROUPS))
     d.insert(0, "floor", Ls.cpu().numpy())

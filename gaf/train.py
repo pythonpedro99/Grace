@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.func import functional_call, jvp
+from tqdm.auto import tqdm
 
 from .env import ACT_DIM, GROUPS, ClipEnv, EnvCfg
 from .gate import FloorGate, floor_probe
@@ -106,10 +107,12 @@ def _is_floor_step(c: Cfg, step: int) -> bool:
                                      and (step - c.floor_start) % c.floor_every == 0)
 
 
-def run(cfg: Cfg, out, verbose: bool = True) -> dict:
+def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     """Train one arm. Writes <out>/<run_id>/{metrics.csv, dirs.npz, model.pt, summary.json}.
 
     Finished runs (summary.json present) are skipped and their summary returned.
+    on_step(steps_done, phase) is called every step (phase "train") and when a longer phase
+    starts: "floor probe", "eval", "final probes", then "done". log(str) gets the eval lines.
     """
     assert cfg.arm in ARMS, f"unknown arm {cfg.arm}"
     odir = Path(out) / cfg.run_id
@@ -139,7 +142,11 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
     t0 = time.time()
 
     for step in range(cfg.steps):
+        if on_step:
+            on_step(step, "train")
         if _is_floor_step(cfg, step):
+            if on_step:
+                on_step(step, "floor probe")
             Ls, Q, pr = floor_probe(enc, tgt_enc, env, cfg.floor_steps, cfg.floor_pool,
                                     lr=cfg.lr, wd=cfg.wd, basis=cfg.basis, probe=probe,
                                     pred=P)
@@ -223,6 +230,8 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
             acc["lreal_open"].append((lreal * (1 - gate.w_S())).sum().item())
 
         if (step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps:
+            if on_step:
+                on_step(step + 1, "eval")
             m, content = probe_suite(enc, P, env, gate.Q, cfg.probe_n, enc_tgt=enc_ema)
             st = gate.state()
             row = {"step": step + 1, "n_S": int(st["inS"].sum()),
@@ -242,11 +251,13 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
             rows.append(row)
             acc.clear()
             if verbose:
-                print(f"  [{cfg.arm} s{cfg.seed}] step {step + 1:>6}  loss {row['loss']:.4f}  "
+                log(f"  [{cfg.arm} s{cfg.seed}] step {step + 1:>6}  loss {row['loss']:.4f}  "
                       f"|S| {row['n_S']:>2}/{D}  " + "  ".join(
                           f"{g} {row[f'r2_{g}']:.2f}" for g in GROUPS)
-                      + f"  ({time.time() - t0:.0f}s)", flush=True)
+                      + f"  ({time.time() - t0:.0f}s)")
 
+    if on_step:
+        on_step(cfg.steps, "final probes")
     summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": time.time() - t0,
                "final": rows[-1], **mlp_probe(enc, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps)}
     pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
@@ -258,6 +269,8 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
                 "enc_ema": enc_ema.state_dict() if enc_ema is not None else None},
                odir / "model.pt")
     (odir / "summary.json").write_text(json.dumps(summary))
+    if on_step:
+        on_step(cfg.steps, "done")
     return summary
 
 
@@ -277,11 +290,11 @@ def load_model(cfg: Cfg, out):
 
 # ---- checks that need no encoder --------------------------------------------------------------
 def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0,
-           actions=True) -> pd.DataFrame:
+           actions=True, desc: str | None = None) -> pd.DataFrame:
     """Learnability on ground truth: a predictor from the true context factors (and actions)
     to the true target factors. Held-out R^2 per group over steps (slow fast, hard slower,
     noise ~0). actions=False hides the actions: fast and hard should then become unpredictable,
-    which confirms that they are action-conditioned."""
+    which confirms that they are action-conditioned. desc: label of a progress bar (None: none)."""
     dev = device()
     torch.manual_seed(seed)
     env = ClipEnv(env_cfg, dev)
@@ -297,10 +310,10 @@ def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0,
         torch.nn.Linear((d_in + ACT_DIM) * (env_cfg.T - 1), 256), torch.nn.GELU(),
         torch.nn.Linear(256, 256), torch.nn.GELU(), torch.nn.Linear(256, d_in)).to(dev)
     opt = torch.optim.Adam(net.parameters(), 1e-3)
-    xt, yt = xy(env.sample(8192))
+    xt, yt = xy(env.sample(8192, render=False))
     rows = []
-    for step in range(steps):
-        x, y = xy(env.sample(512))
+    for step in tqdm(range(steps), desc=desc, unit="step", disable=desc is None):
+        x, y = xy(env.sample(512, render=False))
         loss = (net(x) - y).pow(2).mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()

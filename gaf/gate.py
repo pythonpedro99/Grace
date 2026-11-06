@@ -11,6 +11,7 @@ L*_j comes from `floor_probe`: a fresh predictor trained on a frozen snapshot of
 from collections import deque
 
 import torch
+from tqdm.auto import tqdm
 
 from .models import Predictor, frozen_copy
 
@@ -132,7 +133,7 @@ def excess_basis(C_P, C_star, C_z):
 
 
 def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1e-3, wd=0.0,
-                basis="excess", hidden=256, probe=None, pred=None):
+                basis="excess", hidden=256, probe=None, pred=None, desc=None):
     """Floor L*_j: a predictor trained on frozen snapshots of the encoder(s).
 
     Trained with AdamW(lr, wd) like the predictor, so P and the probe can reach the same error.
@@ -146,6 +147,7 @@ def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1
       "resid"  eigenvectors of the probe's residual covariance, largest first: separates noise
                (high floor) from predictable content, but not learned from not-yet-learned.
       "dim"    Q = I (latent dims; arbitrary under SIGReg's rotation invariance).
+    desc: label of a progress bar over the probe's training steps (None: none).
     """
     enc_ctx, enc_tgt = frozen_copy(enc_ctx), frozen_copy(enc_tgt)
     zc, a, zt = encode_pool(enc_ctx, enc_tgt, env, n_pool)
@@ -153,7 +155,7 @@ def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1
     D, T = zt.shape[1], zc.shape[1] + 1
     probe = probe if probe is not None else Predictor(D, T, a.shape[-1], hidden).to(zt.device)
     opt = torch.optim.AdamW(probe.parameters(), lr, weight_decay=wd)
-    for _ in range(steps):
+    for _ in tqdm(range(steps), desc=desc, unit="step", disable=desc is None, leave=False):
         i = torch.randint(0, n_tr, (batch,), device=zt.device)
         loss = (probe(zc[i], a[i]) - zt[i]).pow(2).mean()
         opt.zero_grad(set_to_none=True)

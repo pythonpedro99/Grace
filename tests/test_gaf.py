@@ -121,9 +121,9 @@ def test_split_adamw_projection_controls_actual_step(alpha):
 
 
 def test_dynamics_need_actions():
-    """Without the actions, fast and hard stay near their caps (0.25, 0.05); slow does not."""
+    """Without the actions, fast and hard stay below their cap of 0.25; slow does not."""
     r = run_gt(SMALL, steps=300, eval_every=300, actions=False).iloc[-1]
-    assert r["fast"] < 0.35 and r["hard"] < 0.15 and r["slow"] > 0.8
+    assert r["fast"] < 0.35 and r["hard"] < 0.35 and r["slow"] > 0.8
 
 
 @pytest.mark.parametrize("scale", [1.0, 2.0])
@@ -213,13 +213,46 @@ def test_tiny_run(arm, tmp_path):
     assert json.loads((tmp_path / cfg.run_id / "summary.json").read_text())["run_id"] == cfg.run_id
 
 
-def test_parallel_execute(tmp_path):
+TINY = dict(env=SMALL, D=8, steps=10, batch=16, floor_start=5, floor_every=5, floor_steps=5,
+            floor_pool=128, eval_every=10, diag_every=5, min_dwell=2, window=5, probe_n=128,
+            mlp_n=256, mlp_steps=5)
+
+
+def test_on_step_reports_every_phase(tmp_path):
+    calls, lines = [], []
+    run(Cfg(arm="sg", **TINY), tmp_path, on_step=lambda s, ph: calls.append((s, ph)),
+        log=lines.append)
+    steps = [s for s, _ in calls]
+    assert steps == sorted(steps) and steps[-1] == 10
+    assert {ph for _, ph in calls} == {"train", "floor probe", "eval", "final probes", "done"}
+    assert [s for s, ph in calls if ph == "train"] == list(range(10))
+    assert len(lines) == 1 and lines[0].lstrip().startswith("[sg s0]")  # eval line via log
+
+
+def test_execute_sequential_shows_a_bar(tmp_path, capsys):
     from gaf.analysis import collect, execute
-    base = dict(env=SMALL, D=8, steps=10, batch=16, floor_start=5, floor_every=5, floor_steps=5,
-                floor_pool=128, eval_every=10, diag_every=5, min_dwell=2, window=5, probe_n=128,
-                mlp_n=256, mlp_steps=5)
-    cfgs = [Cfg(arm="sg", seed=0, **base), Cfg(arm="both", seed=0, **base)]
+    execute([Cfg(arm="sg", seed=0, **TINY), Cfg(arm="detached", seed=0, **TINY)], tmp_path)
+    err = capsys.readouterr().err
+    assert "training" in err and "100%" in err and len(collect(tmp_path)) == 2
+
+
+def test_parallel_execute(tmp_path):
+    import json
+
+    from gaf.analysis import collect, execute
+    cfgs = [Cfg(arm="sg", seed=0, **TINY), Cfg(arm="both", seed=0, **TINY)]
     execute(cfgs, tmp_path, workers=2)
     assert len(collect(tmp_path)) == 2
     assert all((tmp_path / c.run_id / "log.txt").read_text() for c in cfgs)
+    for c in cfgs:  # the worker reported its last phase to the parent through progress.json
+        assert json.loads((tmp_path / c.run_id / "progress.json").read_text()) == {
+            "step": 10, "phase": "done"}
     execute(cfgs, tmp_path, workers=2)  # everything done: nothing runs again
+
+
+def test_parallel_execute_reports_failures(tmp_path):
+    from gaf.analysis import execute
+    good, bad = Cfg(arm="sg", seed=0, **TINY), Cfg(arm="no-such-arm", seed=1, **TINY)
+    with pytest.raises(RuntimeError, match="1 run"):
+        execute([good, bad], tmp_path, workers=2, progress=False)
+    assert (tmp_path / good.run_id / "summary.json").exists()  # the other run still finished

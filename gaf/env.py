@@ -35,7 +35,10 @@ class EnvCfg:
     v_act: float = 0.3  # fast sprite: displacement per unit action, in image widths
     # without the action, R^2 of e(p') from e(p) is capped at (sin(2 pi v) / (2 pi v))^2: 0.25
     hard_k: int = 2  # hard sprite map multiplier (2 = doubling map, higher = harder)
-    h_act: float = 0.4  # hard sprite: displacement per unit action (no-action cap 0.05)
+    # hard: the same cap, but a long plateau before it is learned. The plateau grows steeply with
+    # h_act (ground-truth predictor, t90 in steps: 0.1 <750, 0.2-0.25 ~1500, 0.3 2250-3000 over
+    # 4 seeds, 0.35 unreliable, >= 0.4 not within 6000 steps: unlearnable, not hard to learn)
+    h_act: float = 0.3  # hard sprite: displacement per unit action
     sprite_sigma: float = 0.06  # sprite radius in image widths
     a_slow: float = 1.0  # pixel RMS of the slow part
     a_noise: float = 1.0  # pixel RMS of the noise part
@@ -101,7 +104,8 @@ class ClipEnv:
         self.dims = {"slow": cfg.n_slow, "fast": 4, "hard": 4, "noise": cfg.n_noise}
 
     @torch.no_grad()
-    def sample(self, n: int) -> Clip:
+    def sample(self, n: int, render: bool = True) -> Clip:
+        """n i.i.d. clips. render=False skips the pixels (x is None): ground-truth checks only."""
         c, dev, T = self.cfg, self.dev, self.cfg.T
         s = [torch.randn(n, c.n_slow, device=dev)]
         for _ in range(T - 1):
@@ -116,12 +120,14 @@ class ClipEnv:
             q.append((c.hard_k * q[-1] + c.h_act * a[:, t]) % 1)
         p, q = torch.stack(p, 1), torch.stack(q, 1)  # (n, T, 2)
 
+        f = {"slow": s, "fast": _emb(p), "hard": _emb(q), "noise": noise}
+        if not render:
+            return Clip(None, a, f)
         x = s @ self.B_slow + noise @ self.B_noise  # (n, T, 3 res^2)
         x = x.view(n, T, 3, c.res, c.res)
         for amp, col, pos in ((c.a_fast, self.col_fast, p), (c.a_hard, self.col_hard, q)):
             x = x + amp * col[:, None, None] * _bump(pos, c.res, c.sprite_sigma)[:, :, None]
         x = x + c.pixel_noise * torch.randn_like(x)
-        f = {"slow": s, "fast": _emb(p), "hard": _emb(q), "noise": noise}
         return Clip(x, a, f)
 
     def factors(self, clip: Clip, t: int = -1) -> torch.Tensor:

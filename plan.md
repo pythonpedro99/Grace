@@ -10,10 +10,16 @@ does. The second half lists what can make the experiment fail or mislead, and wh
    1 target. Actions `a_t ∈ [−1, 1]²` (uniform random policy) act between frames. The predictor
    sees all T − 1 actions, the encoder none.
 2. **The predictable sprite content is action-conditioned.**
-   - Fast: `p' = p + 0.3 a`. Hard: `q' = 2q + 0.4 a (mod 1)`.
-   - Without the action, R² is capped at `(sin 2πv / 2πv)²`: 0.25 (fast) and 0.05 (hard).
+   - Fast: `p' = p + 0.3 a`. Hard: `q' = 2q + 0.3 a (mod 1)`.
+   - Without the action, R² is capped at `(sin 2πv / 2πv)²`: 0.25 for both.
      `test_dynamics_need_actions` checks it.
    - At the first draft's `v = 0.12` the cap was 0.8, and the action would have hardly mattered.
+   - **`h_act` sets how hard "hard" is, through a plateau.** Ground-truth predictor, MLP on raw
+     factors and actions, learn time t90 in steps: `h_act` 0.1 < 750, 0.2–0.25 ≈ 1500, 0.3 ≈ 2250–3000
+     (4 seeds, all learned), 0.35 unreliable, 0.4 not learned within 6000 steps, also with
+     `hard_k = 3`. The first default, 0.4, made hard unlearnable instead of hard to learn: no
+     predictor or probe could ever learn it, so the gate could not tell it from noise. 0.3 is at the
+     edge of reliability; fall back to 0.25 if hard is not learned in the real runs.
 3. **Slow and noise look identical.** Both are smooth colour patterns from one orthonormal basis.
    Only the dynamics separate them.
 4. **Capacity and premise.**
