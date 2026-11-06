@@ -42,9 +42,11 @@ does. The second half lists what can make the experiment fail or mislead, and wh
 12. **Floor:** minimum over the last 3 refreshes, × 0.9. The probe has the predictor's architecture
     and optimizer (AdamW, same lr and wd), sees the actions, and is warm-started across refreshes.
 13. **Basis: `excess` by default.**
-    - The generalized eigenvectors of `C_P v = λ (C* + δI) v`, from the current predictor and the
-      probe on the same held-out pool, orthonormalized in order (QR).
-    - `λ − 1` is the relative excess along v: the gate's decision quantity.
+    - The generalized eigenvectors of `(C_P − C*) v = λ Cov(z_t) v`, from the current predictor,
+      the probe and the latents on the same held-out pool, orthonormalized in order (QR).
+    - λ is the share of the variance along v that the predictor still misses beyond the floor:
+      the gate's excess condition in white coordinates. It does not depend on δ.
+    - SIGReg gives no basis itself (Cov(z) ≈ I is fully degenerate), only the metric.
     - At each refresh the running state (gap, L̄, S, dwell, floor history) is rotated with the
       squared overlap matrix of the old and new bases. `resid` (eigenbasis of C\* alone) and `dim`
       are ablations.
@@ -84,13 +86,13 @@ Ordered by how likely they are to break the experiment or its interpretation.
      content. Per-dim gating then decides for mixtures. A direction mixing noise with unlearned
      sprite content is either protected (noise survives) or opened (the sprite is lost).
    - **Guard:** the `excess` basis diagonalizes the decision quantity itself. Unlearned content
-     (large λ) separates from learned content and noise (λ ≈ 1). Inside the λ ≈ 1 subspace the
+     (large λ) separates from learned content and noise (λ ≈ 0). Inside the λ ≈ 0 subspace the
      directions are arbitrary, but all of them are open anyway.
    - **Remaining risk 1:** the basis is fixed between refreshes (every `floor_every` steps), while
      the predictor learns. Directions whose content becomes learned stay in S until their excess
      falls; that error is on the protective side.
    - **Remaining risk 2:** if the probe has not learned a sprite (point 1), C\* ≈ C_P on its
-     directions. λ ≈ 1, and the basis cannot save it.
+     directions. λ ≈ 0, and the basis cannot save it.
 3. **The optimizer** (answered by SplitAdamW).
    - **Risk:** with Adam(W), about 90% of the step is momentum, preconditioned by M, plus weight
      decay. Projecting the raw gradient leaves all of that free to leak: the dry run measured
@@ -128,6 +130,24 @@ Ordered by how likely they are to break the experiment or its interpretation.
    (`hard_k = 3`), stronger SIGReg (`lam`), or D < n_slow.
 10. **First-order leak estimates.** `leak_jvp` and `ℓ` are first-order in lr; `ℓ_real` is exact
     but includes everything that moved. Compare them before trusting either alone.
+
+## Bases considered
+
+All in white coordinates (Cov(z) ≈ I under SIGReg). Values per direction type: slow / fast / hard /
+noise.
+
+| Matrix | Meaning of vᵀAv | Values | Separates |
+|---|---|---|---|
+| I (dims), Cov(z) (PCA) | –, variance | – / 1 / 1 / 1 | nothing |
+| Cov(z_{t+1} − z_t) (SFA = AMUSE) | 2 (1 − autocorr.) | 0.04 / 1 / 2 / 2 | slow vs. rest |
+| C\* (`resid`) | irreducible error share | 0.04 / 0 / 0 / 1 | noise vs. predictable |
+| C_P | current error share | low / high→low / high / 1 | learned vs. unlearned + noise |
+| C_lag − C_P | recent progress | 0 / >0 / small / 0 | currently learning |
+| C_P − C\* (`excess`, default) | missed share beyond floor | 0 / high→0 / high / 0 | unlearned vs. rest |
+| C\*_no-action − C\* | action-explained share | 0 / 0.75 / 0.95 / 0 | action-driven vs. rest |
+
+Candidates for later: controllability as an extra protection rule (it targets the probe-bias risk for
+hard), SFA as a diagnostic, and an S defined as a subspace instead of per-direction state.
 
 ## Open
 - **Not run on a GPU yet.** Only CPU tests and a tiny dry run of the notebook have run.

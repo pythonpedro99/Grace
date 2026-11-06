@@ -80,18 +80,24 @@ Every arm runs the same optimizer, gate and diagnostics, so the leak can be comp
 - **Directions, `gate.excess_basis`:**
   - Under SIGReg the latent is rotation-invariant, so single latent dims are arbitrary mixtures of
     content.
+  - SIGReg makes Cov(z) ≈ I, so PCA of z is degenerate and gives no basis either. What whitening
+    does give: for any covariance A, `vᵀ A v` is a share of the (unit) variance along v.
   - The default `basis="excess"` ranks directions by the gate's own decision quantity. At each
-    refresh it solves `C_P v = λ (C* + δI) v`, where C_P and C\* are the held-out residual
-    covariances of the current predictor and of the floor probe, on the same frozen snapshot.
-    `λ − 1` is the relative excess e along v.
+    refresh it solves `(C_P − C*) v = λ Cov(z_t) v`. C_P and C\* are the held-out residual
+    covariances of the current predictor and of the floor probe, and all three matrices come from
+    the same frozen snapshot and pool. λ is the share of the variance along v that the predictor
+    still misses beyond the floor. The measured Cov(z_t) is used, not I, because SIGReg holds only
+    approximately.
   - Content the predictor has not learned yet gets large λ (protect). Learned content and noise at
-    its floor get λ ≈ 1 (open).
-  - The generalized eigenvectors are not orthogonal. QR in order keeps the nested top-k subspaces
-    and gives an orthonormal basis, so the split of the gradient over directions stays exact.
+    its floor get λ ≈ 0 (open).
+  - The solutions are Cov(z)-orthonormal. QR in order keeps the nested top-k subspaces and gives a
+    Euclidean-orthonormal basis, so the split of the gradient over directions stays exact.
   - The running state is rotated into each new basis.
   - Ablations: `basis="resid"` (eigenbasis of C\* alone) separates noise from predictable content,
     but not learned from not-yet-learned, since both sit at floor ≈ 0. `basis="dim"` uses latent
     dims.
+  - Other possible bases (slow feature analysis on z_{t+1} − z_t; action controllability from a
+    probe without actions; progress C_lag − C_P) are compared in plan.md.
 - **Projection on the applied AdamW step (§6, §10), `grads.SplitAdamW`:**
   - The one-pager derives the projection for SGD. An AdamW step is `−lr (M m̂ + wd θ)`, where
     `M = 1/(√v̂ + ε)` is the preconditioner and the momentum `m̂` is about 90% past gradients.
@@ -131,8 +137,16 @@ Every arm runs the same optimizer, gate and diagnostics, so the leak can be comp
 1. Upload or clone this folder to `/workspace`.
 2. Open `gain_attribution.ipynb` and run it top to bottom.
 
-Results go to `/workspace/results/<run_id>/`: `metrics.csv`, `dirs.npz`, `model.pt` and
-`summary.json`. A run whose `summary.json` exists is skipped, so re-running a cell resumes.
+Results go to `/workspace/results/<run_id>/`: `metrics.csv`, `dirs.npz`, `model.pt`,
+`summary.json` and `log.txt`. A run whose `summary.json` exists is skipped, so re-running a cell
+resumes.
+
+`WORKERS = 3` in the notebook runs three runs at once, as separate processes on the same GPU. The
+model is small and the GPU mostly waits on kernel launches, so this is close to a 3× speed-up. Watch
+one run with `tail -f /workspace/results/<run_id>/log.txt`.
+
+Rough budget: 4–7 min per run alone; the full notebook (39 runs) takes about 3–4.5 h sequentially,
+roughly 1–2 h with 3 workers. These are estimates; the first stage prints real timings.
 
 **Locally** (CPU is enough for the tests, about 40 s):
 

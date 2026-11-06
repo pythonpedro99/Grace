@@ -142,7 +142,7 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
         if _is_floor_step(cfg, step):
             Ls, Q, pr = floor_probe(enc, tgt_enc, env, cfg.floor_steps, cfg.floor_pool,
                                     lr=cfg.lr, wd=cfg.wd, basis=cfg.basis, probe=probe,
-                                    pred=P, delta=cfg.delta)
+                                    pred=P)
             probe = pr if cfg.floor_warm else None
             gate.set_floor(Ls, None if cfg.basis == "dim" else Q)
             floors.append((step, Ls.cpu()))

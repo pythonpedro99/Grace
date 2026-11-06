@@ -111,18 +111,20 @@ def encode_pool(enc_ctx, enc_tgt, env, n: int, chunk: int = 2048):
     return torch.cat(zc), torch.cat(a), torch.cat(zt)
 
 
-def excess_basis(C_P, C_star, delta=0.01):
-    """Orthonormal basis ordered by the predictor's relative excess over the floor.
+def excess_basis(C_P, C_star, C_z):
+    """Orthonormal basis ordered by the predictor's excess over the floor, in white coordinates.
 
-    Solves C_P v = lam (C_star + delta I) v. lam - 1 is the relative excess e along v: large for
-    content the predictor has not learned yet, ~1 for learned content and for noise at its floor.
-    The generalized eigenvectors are not orthogonal; QR in order keeps the nested top-k subspaces
-    and returns an orthonormal Q (the gradient split over directions stays exact). Returns (Q, lam).
+    Solves (C_P - C_star) v = lam C_z v with C_z = Cov(z_t). SIGReg makes z white (C_z ~ I), so
+    lam is the share of the variance along v that the predictor still misses beyond the floor:
+    large for content it has not learned yet, ~0 for learned content and for noise at its floor.
+    Using the measured C_z (not I) keeps this exact when SIGReg holds only approximately.
+    The solutions are C_z-orthonormal; QR in order turns them into a Euclidean-orthonormal Q with
+    the same nested top-k subspaces, so the split of the gradient over directions stays exact.
+    Returns (Q, lam), lam in decreasing order.
     """
-    D = C_P.shape[0]
-    ev, U = torch.linalg.eigh(C_star + delta * torch.eye(D, device=C_P.device))
-    W = U @ torch.diag(ev.clamp_min(1e-12).rsqrt()) @ U.T  # (C_star + delta I)^(-1/2)
-    M = W @ C_P @ W
+    ev, U = torch.linalg.eigh(C_z)
+    W = U @ torch.diag(ev.clamp_min(1e-8).rsqrt()) @ U.T  # C_z^(-1/2)
+    M = W @ (C_P - C_star) @ W
     lam, Uw = torch.linalg.eigh((M + M.T) / 2)
     lam, Uw = lam.flip(0), Uw.flip(1)
     Q, R = torch.linalg.qr(W @ Uw)
@@ -130,7 +132,7 @@ def excess_basis(C_P, C_star, delta=0.01):
 
 
 def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1e-3, wd=0.0,
-                basis="excess", hidden=256, probe=None, pred=None, delta=0.01):
+                basis="excess", hidden=256, probe=None, pred=None):
     """Floor L*_j: a predictor trained on frozen snapshots of the encoder(s).
 
     Trained with AdamW(lr, wd) like the predictor, so P and the probe can reach the same error.
@@ -138,8 +140,9 @@ def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1
     previous probe (its budget accumulates over refreshes); None trains a fresh one.
     Basis Q of the gate:
       "excess" (needs `pred`, the current predictor): `excess_basis` of the predictor's and the
-               probe's held-out residual covariances: directions ranked by e, the gate's own
-               decision quantity. Separates not-yet-learned from learned content.
+               probe's held-out residual covariances in the metric Cov(z_t): directions ranked
+               by the variance share the predictor still misses. Separates not-yet-learned
+               from learned content and noise.
       "resid"  eigenvectors of the probe's residual covariance, largest first: separates noise
                (high floor) from predictable content, but not learned from not-yet-learned.
       "dim"    Q = I (latent dims; arbitrary under SIGReg's rotation invariance).
@@ -161,7 +164,7 @@ def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1
         C_star = r.T @ r / len(r)
         if basis == "excess":
             rp = pred(zc[n_tr:], a[n_tr:]) - zt[n_tr:]
-            Q, _ = excess_basis(rp.T @ rp / len(rp), C_star, delta)
+            Q, _ = excess_basis(rp.T @ rp / len(rp), C_star, torch.cov(zt[n_tr:].T))
         elif basis == "resid":
             Q = torch.linalg.eigh(C_star)[1].flip(-1)
         else:

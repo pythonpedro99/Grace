@@ -1,6 +1,9 @@
 """Run grids, result collection, tables, verdicts and figures for the notebook."""
+import contextlib
 import json
+import multiprocessing as mp
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -35,15 +38,56 @@ def grid(arms, seeds=(0, 1, 2), **common) -> list[Cfg]:
     return [Cfg(arm=a, seed=s, **common) for a in arms for s in seeds]
 
 
-def execute(cfgs, out) -> None:
-    for i, c in enumerate(cfgs, 1):
-        t = time.time()
-        done = (Path(out) / c.run_id / "summary.json").exists()
-        print(f"[{i}/{len(cfgs)}] {c.arm} seed={c.seed} {c.tag} "
-              + ("(done)" if done else "..."), flush=True)
-        run(c, out)
-        if not done:
+def _label(c: Cfg) -> str:
+    return f"{c.arm} seed={c.seed} D={c.D}" + (f" [{c.tag}]" if c.tag else "")
+
+
+def _work(cfg: Cfg, out) -> float:
+    """One run in a worker process; its progress goes to <run_id>/log.txt."""
+    torch.set_num_threads(2)  # several workers share the CPU (data sampling, small ops)
+    odir = Path(out) / cfg.run_id
+    odir.mkdir(parents=True, exist_ok=True)
+    t = time.time()
+    with open(odir / "log.txt", "a") as f, contextlib.redirect_stdout(f):
+        run(cfg, out, verbose=True)
+    return time.time() - t
+
+
+def execute(cfgs, out, workers: int = 1) -> None:
+    """Run every cfg whose summary.json does not exist yet.
+
+    workers=1: sequentially in this process (progress printed here). workers>1: that many runs
+    at once in separate processes on the same GPU. The model is small and launch-bound, so
+    3-4 workers give close to a proportional speed-up; per-run progress is in <run_id>/log.txt.
+    A failing run does not stop the others; the errors are raised at the end.
+    """
+    todo = [c for c in cfgs if not (Path(out) / c.run_id / "summary.json").exists()]
+    print(f"{len(cfgs) - len(todo)} of {len(cfgs)} runs already done, {len(todo)} to go"
+          + (f" on {workers} workers" if workers > 1 and todo else ""), flush=True)
+    t0, errors = time.time(), []
+    if workers <= 1:
+        for i, c in enumerate(todo, 1):
+            t = time.time()
+            print(f"[{i}/{len(todo)}] {_label(c)}", flush=True)
+            run(c, out)
             print(f"    finished in {time.time() - t:.0f}s", flush=True)
+        return
+    ctx = mp.get_context("spawn")  # CUDA cannot be shared with forked workers
+    with ProcessPoolExecutor(workers, mp_context=ctx) as pool:
+        futs = {pool.submit(_work, c, str(out)): c for c in todo}
+        for i, fut in enumerate(as_completed(futs), 1):
+            c = futs[fut]
+            try:
+                sec = fut.result()
+                print(f"[{i}/{len(todo)}] {_label(c)} finished in {sec:.0f}s "
+                      f"(wall {time.time() - t0:.0f}s)", flush=True)
+            except Exception as e:  # noqa: BLE001
+                errors.append((c, e))
+                print(f"[{i}/{len(todo)}] {_label(c)} FAILED: {e!r} "
+                      f"(log: {Path(out) / c.run_id / 'log.txt'})", flush=True)
+    if errors:
+        names = ", ".join(_label(c) for c, _ in errors)
+        raise RuntimeError(f"{len(errors)} run(s) failed: {names}")
 
 
 # ---- collecting -------------------------------------------------------------------------------
@@ -129,7 +173,7 @@ def floors_of(cfg: Cfg, out, steps=3000, basis="excess") -> pd.DataFrame:
     enc, P, tgt = load_model(cfg, out)
     env = ClipEnv(cfg.env, device())
     Ls, Q, _ = floor_probe(enc, tgt, env, steps=steps, lr=cfg.lr, wd=cfg.wd, basis=basis,
-                           pred=P, delta=cfg.delta)
+                           pred=P)
     c = _content(enc, env, Q)
     d = pd.DataFrame(c, columns=list(GROUPS))
     d.insert(0, "floor", Ls.cpu().numpy())

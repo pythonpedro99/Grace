@@ -126,16 +126,27 @@ def test_dynamics_need_actions():
     assert r["fast"] < 0.35 and r["hard"] < 0.15 and r["slow"] > 0.8
 
 
-def test_excess_basis_finds_unlearned_direction():
+@pytest.mark.parametrize("scale", [1.0, 2.0])
+def test_excess_basis_finds_unlearned_direction(scale):
     """Noise (high floor, P at the floor) and learned content rank low; the direction where the
-    predictor is far above its floor ranks first, although the floor alone cannot tell it apart."""
+    predictor is far above its floor ranks first, although the floor alone cannot tell it apart.
+    lam is the missed share of Cov(z): a latent with twice the variance halves it."""
     R = torch.linalg.qr(torch.randn(4, 4, generator=torch.Generator().manual_seed(0)))[0]
     C_star = R @ torch.diag(torch.tensor([1.0, 0.0, 0.0, 0.0])) @ R.T  # dir 0: noise floor
     C_P = R @ torch.diag(torch.tensor([1.0, 0.5, 0.0, 0.0])) @ R.T  # dir 1: not learned yet
-    Q, lam = excess_basis(C_P, C_star, delta=0.01)
+    Q, lam = excess_basis(C_P, C_star, scale * torch.eye(4))
     assert torch.allclose(Q.T @ Q, torch.eye(4), atol=1e-5)
-    assert abs(torch.dot(Q[:, 0], R[:, 1])) > 0.999 and lam[0] == pytest.approx(50, rel=1e-3)
-    assert lam[1] == pytest.approx(1.0, abs=0.02)  # noise: predictor at its floor
+    assert abs(torch.dot(Q[:, 0], R[:, 1])) > 0.999
+    assert lam[0] == pytest.approx(0.5 / scale, rel=1e-4) and lam[1:].abs().max() < 1e-5
+
+
+def test_excess_basis_uses_the_latent_metric():
+    """With a non-white latent the solutions are Cov(z)-orthonormal before QR; the top direction
+    is the one with the largest missed share of its own variance, not of the Euclidean norm."""
+    C_z = torch.diag(torch.tensor([4.0, 1.0]))
+    C_P = torch.diag(torch.tensor([1.0, 0.5]))  # misses 1/4 of dim 0, 1/2 of dim 1
+    Q, lam = excess_basis(C_P, torch.zeros(2, 2), C_z)
+    assert abs(Q[1, 0]) > 0.999 and lam.tolist() == pytest.approx([0.5, 0.25], rel=1e-5)
 
 
 def test_gate_hysteresis_and_floor():
@@ -200,3 +211,15 @@ def test_tiny_run(arm, tmp_path):
     if arm in ("context", "both"):  # projection is M-orthogonal: the Euclidean norm may grow
         assert 0 <= f["leak_pos"] <= 1 and math.isfinite(f["proj_ratio"])
     assert json.loads((tmp_path / cfg.run_id / "summary.json").read_text())["run_id"] == cfg.run_id
+
+
+def test_parallel_execute(tmp_path):
+    from gaf.analysis import collect, execute
+    base = dict(env=SMALL, D=8, steps=10, batch=16, floor_start=5, floor_every=5, floor_steps=5,
+                floor_pool=128, eval_every=10, diag_every=5, min_dwell=2, window=5, probe_n=128,
+                mlp_n=256, mlp_steps=5)
+    cfgs = [Cfg(arm="sg", seed=0, **base), Cfg(arm="both", seed=0, **base)]
+    execute(cfgs, tmp_path, workers=2)
+    assert len(collect(tmp_path)) == 2
+    assert all((tmp_path / c.run_id / "log.txt").read_text() for c in cfgs)
+    execute(cfgs, tmp_path, workers=2)  # everything done: nothing runs again
