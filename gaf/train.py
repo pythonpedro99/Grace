@@ -54,7 +54,7 @@ class Cfg:
     arm: str = "sg"
     seed: int = 0
     env: EnvCfg = field(default_factory=EnvCfg)
-    D: int = 16  # latent size
+    D: int = 32  # latent size (n_slow = 16: room for every group; D = n_slow is the tight regime)
     steps: int = 20_000
     batch: int = 256  # clips per step
     lr: float = 1e-3
@@ -74,7 +74,7 @@ class Cfg:
     delta: float = 0.01  # floor offset: e = (L - L*) / (L* + delta)
     min_dwell: int = 500
     soft: bool = False  # soft open-path weights 1 - clip(gap / gap_ref)
-    basis: str = "resid"  # resid: eigenbasis of the floor probe's residual | dim: latent dims
+    basis: str = "excess"  # excess | resid | dim, see gate.floor_probe
     # floor (section 3)
     floor_start: int = 500
     floor_every: int = 1000  # N
@@ -141,7 +141,8 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
     for step in range(cfg.steps):
         if _is_floor_step(cfg, step):
             Ls, Q, pr = floor_probe(enc, tgt_enc, env, cfg.floor_steps, cfg.floor_pool,
-                                    lr=cfg.lr, wd=cfg.wd, basis=cfg.basis, probe=probe)
+                                    lr=cfg.lr, wd=cfg.wd, basis=cfg.basis, probe=probe,
+                                    pred=P, delta=cfg.delta)
             probe = pr if cfg.floor_warm else None
             gate.set_floor(Ls, None if cfg.basis == "dim" else Q)
             floors.append((step, Ls.cpu()))
@@ -312,24 +313,35 @@ def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0,
 
 
 @torch.no_grad()
-def premise(env_cfg: EnvCfg = EnvCfg(), D: int = 16, n: int = 4096) -> pd.Series:
-    """SIGReg of hand-made latents: can slow content alone satisfy SIGReg at latent size D?
+def premise(env_cfg: EnvCfg = EnvCfg(), D: int = 32, n: int = 4096) -> pd.Series:
+    """SIGReg of hand-made latents of size D: can slow content alone satisfy SIGReg?
 
-    Each candidate fills D dims with whitened factors (zero-padded if the group is too small).
-    'gaussian' is the N(0, I) reference. Slow-only close to gaussian = the shortcut exists.
+    gaussian           N(0, I) reference (the floor of the statistic at this n)
+    slow               the slow factors, zero-padded if n_slow < D (linear content only)
+    slow+copies        slow factors plus Gaussianized nonlinear copies (pairwise products) in the
+                       remaining dims: what an encoder can fill spare room with using slow content
+                       only. Close to gaussian = the shortcut exists even with spare capacity.
+    fast+hard          sprite factors, zero-padded
     """
     env = ClipEnv(env_cfg, device())
     clip = env.sample(n)
 
-    def lat(*groups):
-        z = torch.cat([clip.f[g][:, -1] for g in groups], -1)
-        z = (z - z.mean(0)) / z.std(0)
+    def std(z):
+        return (z - z.mean(0)) / z.std(0)
+
+    def pad(z):
+        z = std(z)
         if z.shape[1] < D:
             z = torch.cat([z, torch.zeros(n, D - z.shape[1], device=z.device)], 1)
         return z[None, :, :D]
 
+    s = clip.f["slow"][:, -1]
+    i, j = torch.triu_indices(s.shape[1], s.shape[1], 1, device=s.device)
+    prod = s[:, i] * s[:, j]
+    rank = prod.argsort(0).argsort(0).float()
+    copies = torch.special.ndtri((rank + 0.5) / n)[:, :max(0, D - s.shape[1])]
     torch.manual_seed(0)
-    cand = {"gaussian": torch.randn(1, n, D, device=env.dev), "slow": lat("slow"),
-            "fast+hard": lat("fast", "hard"), "noise": lat("noise"),
-            "slow+fast+hard": lat("fast", "hard", "slow")}
+    cand = {"gaussian": torch.randn(1, n, D, device=env.dev), "slow": pad(s),
+            "slow+copies": pad(torch.cat([s, copies], 1)),
+            "fast+hard": pad(torch.cat([clip.f["fast"][:, -1], clip.f["hard"][:, -1]], 1))}
     return pd.Series({k: sigreg(z, 1024).item() for k, z in cand.items()}, name="SIGReg")

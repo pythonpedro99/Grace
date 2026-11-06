@@ -16,8 +16,12 @@ does. The second half lists what can make the experiment fail or mislead, and wh
    - At the first draft's `v = 0.12` the cap was 0.8, and the action would have hardly mattered.
 3. **Slow and noise look identical.** Both are smooth colour patterns from one orthonormal basis.
    Only the dynamics separate them.
-4. **The premise is built in.** With `n_slow = D` the slow factors alone are an isotropic Gaussian of
-   size D, so SIGReg is satisfiable by slow content alone. `premise()` checks it.
+4. **Capacity and premise.**
+   - The default is D = 32 with n_slow = 16: room for every group.
+   - The premise holds through nonlinear slow copies: Gaussianized pairwise products of the slow
+     factors bring a slow-only latent to SIGReg ≈ 7 at D = 32, against ≈ 1 for a Gaussian and ≈ 230
+     for zero padding. `premise()` reports it.
+   - The tight regime D = n_slow (slow alone is an exact isotropic Gaussian) is notebook stage 4b.
 5. **Sprite salience:** peak brightness 4 against a pattern RMS of 1, σ = 0.06 image widths, white
    (fast) and red (hard). The sprites are visible by eye.
 
@@ -37,9 +41,13 @@ does. The second half lists what can make the experiment fail or mislead, and wh
 11. **Before the first floor (step 500), everything is in S.**
 12. **Floor:** minimum over the last 3 refreshes, × 0.9. The probe has the predictor's architecture
     and optimizer (AdamW, same lr and wd), sees the actions, and is warm-started across refreshes.
-13. **Basis:** the default is the eigenbasis of the probe's held-out residual covariance. At each
-    refresh the running state (gap, L̄, S, dwell, floor history) is rotated with the squared overlap
-    matrix of the old and new bases.
+13. **Basis: `excess` by default.**
+    - The generalized eigenvectors of `C_P v = λ (C* + δI) v`, from the current predictor and the
+      probe on the same held-out pool, orthonormalized in order (QR).
+    - `λ − 1` is the relative excess along v: the gate's decision quantity.
+    - At each refresh the running state (gap, L̄, S, dwell, floor history) is rotated with the
+      squared overlap matrix of the old and new bases. `resid` (eigenbasis of C\* alone) and `dim`
+      are ablations.
 14. **Hysteresis:** enter above a threshold, leave below half of it after `min_dwell` steps.
 
 ### Gradients and optimizer
@@ -55,8 +63,9 @@ does. The second half lists what can make the experiment fail or mislead, and wh
 
 ### Verdicts (notebook)
 19. **Baseline shows the failure:** slow R² ≥ 0.8, and fast and hard R² < 0.3.
-    **Fix works:** fast and hard +0.3 over `sg`, noise within 0.1 of `sg`, and slow still ≥ 0.5.
-    These are seed means of the final ridge R² from z_t, with the MLP probe alongside.
+    **Fix works:** fast and hard +0.3 over `sg`, noise and slow within 0.1 of `sg`. In the tight
+    regime (stage 4b) slow may drop by 0.3. These are seed means of the final ridge R² from z_t,
+    with the MLP probe alongside.
 
 ## Critical points
 
@@ -74,11 +83,14 @@ Ordered by how likely they are to break the experiment or its interpretation.
    - **Risk:** SIGReg makes the latent rotation-invariant, so a latent dim is an arbitrary mix of
      content. Per-dim gating then decides for mixtures. A direction mixing noise with unlearned
      sprite content is either protected (noise survives) or opened (the sprite is lost).
-   - **Guard:** the residual eigenbasis separates high-floor (noise) from low-floor (predictable)
-     subspaces. Inside each subspace the eigenvectors are arbitrary, but their members behave
-     alike.
-   - **Remaining risk:** if the probe has not learned a sprite yet (point 1), its directions sit
-     in the high-floor subspace together with noise.
+   - **Guard:** the `excess` basis diagonalizes the decision quantity itself. Unlearned content
+     (large λ) separates from learned content and noise (λ ≈ 1). Inside the λ ≈ 1 subspace the
+     directions are arbitrary, but all of them are open anyway.
+   - **Remaining risk 1:** the basis is fixed between refreshes (every `floor_every` steps), while
+     the predictor learns. Directions whose content becomes learned stay in S until their excess
+     falls; that error is on the protective side.
+   - **Remaining risk 2:** if the probe has not learned a sprite (point 1), C\* ≈ C_P on its
+     directions. λ ≈ 1, and the basis cannot save it.
 3. **The optimizer** (answered by SplitAdamW).
    - **Risk:** with Adam(W), about 90% of the step is momentum, preconditioned by M, plus weight
      decay. Projecting the raw gradient leaves all of that free to leak: the dry run measured
@@ -103,12 +115,14 @@ Ordered by how likely they are to break the experiment or its interpretation.
    - **Risk:** early on everything is in S, and `g_ctx` and `g_tgt,S` are correlated through shared
      weights. Projection can then remove useful context learning, and `context`/`both` learn slowly.
    - **Watch:** `proj_ratio` and the slow R² curve early in training. **Knob:** `alpha`.
-8. **Capacity versus premise.**
-   - **Trade-off:** with `n_slow = D` the slow content alone fills SIGReg's budget (the premise).
-     Keeping the sprites therefore must cost slow R²: the verdict asks for slow ≥ 0.5, not
-     "unchanged".
-   - **Alternative regime:** `n_slow < D` leaves spare room, which the baseline fills with
-     nonlinear slow copies. That is a weaker premise, but no trade-off. An env sweep cell exists.
+8. **Capacity versus premise** (addressed: the default is the roomy regime, D = 32, n_slow = 16).
+   - **Gain:** a fix does not have to trade slow content for sprites, and the verdict can ask for
+     slow within 0.1 of `sg`.
+   - **Cost:** the premise now relies on slow content filling the spare room with nonlinear copies.
+     `premise()` shows this is nearly free for SIGReg (≈ 7 against ≈ 1), but it is a weaker
+     shortcut than in the tight regime. If `sg` keeps the sprites at D = 32 while dropping them at
+     D = 16 (stage 4b), the failure is capacity-driven, and the roomy regime is not a test of the
+     fix.
 9. **The baseline may not fail.** If `sg` keeps fast and hard content anyway, the stage-2 verdict
    says so, and the fix cannot be evaluated. Add pressure: dimmer sprites (`a_fast`), a harder map
    (`hard_k = 3`), stronger SIGReg (`lam`), or D < n_slow.

@@ -111,15 +111,38 @@ def encode_pool(enc_ctx, enc_tgt, env, n: int, chunk: int = 2048):
     return torch.cat(zc), torch.cat(a), torch.cat(zt)
 
 
+def excess_basis(C_P, C_star, delta=0.01):
+    """Orthonormal basis ordered by the predictor's relative excess over the floor.
+
+    Solves C_P v = lam (C_star + delta I) v. lam - 1 is the relative excess e along v: large for
+    content the predictor has not learned yet, ~1 for learned content and for noise at its floor.
+    The generalized eigenvectors are not orthogonal; QR in order keeps the nested top-k subspaces
+    and returns an orthonormal Q (the gradient split over directions stays exact). Returns (Q, lam).
+    """
+    D = C_P.shape[0]
+    ev, U = torch.linalg.eigh(C_star + delta * torch.eye(D, device=C_P.device))
+    W = U @ torch.diag(ev.clamp_min(1e-12).rsqrt()) @ U.T  # (C_star + delta I)^(-1/2)
+    M = W @ C_P @ W
+    lam, Uw = torch.linalg.eigh((M + M.T) / 2)
+    lam, Uw = lam.flip(0), Uw.flip(1)
+    Q, R = torch.linalg.qr(W @ Uw)
+    return Q * torch.sign(torch.diagonal(R)), lam
+
+
 def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1e-3, wd=0.0,
-                basis="resid", hidden=256, probe=None):
+                basis="excess", hidden=256, probe=None, pred=None, delta=0.01):
     """Floor L*_j: a predictor trained on frozen snapshots of the encoder(s).
 
     Trained with AdamW(lr, wd) like the predictor, so P and the probe can reach the same error.
     Returns (Lstar (D,), Q (D, D), probe), scored on held-out clips. `probe`: warm start from a
     previous probe (its budget accumulates over refreshes); None trains a fresh one.
-    basis="dim": Q = I. basis="resid": Q = eigenvectors of the probe's held-out residual
-    covariance, largest error first: noisy directions separate from predictable ones.
+    Basis Q of the gate:
+      "excess" (needs `pred`, the current predictor): `excess_basis` of the predictor's and the
+               probe's held-out residual covariances: directions ranked by e, the gate's own
+               decision quantity. Separates not-yet-learned from learned content.
+      "resid"  eigenvectors of the probe's residual covariance, largest first: separates noise
+               (high floor) from predictable content, but not learned from not-yet-learned.
+      "dim"    Q = I (latent dims; arbitrary under SIGReg's rotation invariance).
     """
     enc_ctx, enc_tgt = frozen_copy(enc_ctx), frozen_copy(enc_tgt)
     zc, a, zt = encode_pool(enc_ctx, enc_tgt, env, n_pool)
@@ -135,8 +158,12 @@ def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1
         opt.step()
     with torch.no_grad():
         r = probe(zc[n_tr:], a[n_tr:]) - zt[n_tr:]
-    if basis == "resid":
-        Q = torch.linalg.eigh(r.T @ r / len(r))[1].flip(-1)
-    else:
-        Q = torch.eye(D, device=zt.device)
+        C_star = r.T @ r / len(r)
+        if basis == "excess":
+            rp = pred(zc[n_tr:], a[n_tr:]) - zt[n_tr:]
+            Q, _ = excess_basis(rp.T @ rp / len(rp), C_star, delta)
+        elif basis == "resid":
+            Q = torch.linalg.eigh(C_star)[1].flip(-1)
+        else:
+            Q = torch.eye(D, device=zt.device)
     return (r @ Q).pow(2).mean(0), Q, probe

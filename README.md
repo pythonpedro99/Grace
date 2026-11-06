@@ -33,9 +33,14 @@ The predictable sprite content is action-conditioned. Without the action, R² of
 capped at `(sin 2πv / 2πv)²`: 0.25 for fast and 0.05 for hard. `run_gt(actions=False)` checks this.
 
 Slow and noise patterns share one orthonormal pixel basis. Both are equally easy to *read* from
-an image, and only their dynamics differ. With `n_slow ≥ D` the slow factors alone are an isotropic
-Gaussian of size D, so SIGReg can be satisfied without any other content. That is the premise of the
-failure, and the notebook checks it (`premise()`).
+an image, and only their dynamics differ.
+
+**Capacity and the premise.** The failure needs slow content that can fill SIGReg's budget on its
+own. The default latent, D = 32, is twice n_slow = 16, so there is room for every group: a fix does not
+have to trade slow content for sprites. Slow content can still fill the spare room with Gaussianized
+nonlinear copies of itself. `premise()` measures this: at D = 32, slow plus copies reaches SIGReg ≈ 7,
+against ≈ 1 for a true Gaussian and ≈ 230 for slow content alone. The tight regime D = n_slow, where
+slow content alone is an exact isotropic Gaussian, is its own notebook stage (4b).
 
 Knobs: `n_slow`, `slow_rho`, `n_noise`, `v_act`, `h_act` (action strength), `hard_k`
 (difficulty), `a_*` (salience), `pixel_noise`, `res`, `T`.
@@ -72,11 +77,21 @@ Every arm runs the same optimizer, gate and diagnostics, so the leak can be comp
   excess `e_j = (L̄_j − L*_j) / (L*_j + δ)`. A direction enters S when the gap exceeds `eps_g` or the
   excess exceeds `eps_f`. It leaves only when both are below half of their threshold and `min_dwell`
   steps have passed. Before the first floor exists, everything is in S.
-- **Directions:** the default `basis="resid"` is the eigenbasis of the floor probe's held-out
-  residual covariance. Under SIGReg the latent is rotation-invariant, so single latent dims are
-  arbitrary mixtures of content. The residual eigenbasis separates noisy directions (high floor)
-  from predictable ones (floor ≈ 0). The running state is rotated into each new basis.
-  `basis="dim"` remains as an ablation.
+- **Directions, `gate.excess_basis`:**
+  - Under SIGReg the latent is rotation-invariant, so single latent dims are arbitrary mixtures of
+    content.
+  - The default `basis="excess"` ranks directions by the gate's own decision quantity. At each
+    refresh it solves `C_P v = λ (C* + δI) v`, where C_P and C\* are the held-out residual
+    covariances of the current predictor and of the floor probe, on the same frozen snapshot.
+    `λ − 1` is the relative excess e along v.
+  - Content the predictor has not learned yet gets large λ (protect). Learned content and noise at
+    its floor get λ ≈ 1 (open).
+  - The generalized eigenvectors are not orthogonal. QR in order keeps the nested top-k subspaces
+    and gives an orthonormal basis, so the split of the gradient over directions stays exact.
+  - The running state is rotated into each new basis.
+  - Ablations: `basis="resid"` (eigenbasis of C\* alone) separates noise from predictable content,
+    but not learned from not-yet-learned, since both sit at floor ≈ 0. `basis="dim"` uses latent
+    dims.
 - **Projection on the applied AdamW step (§6, §10), `grads.SplitAdamW`:**
   - The one-pager derives the projection for SGD. An AdamW step is `−lr (M m̂ + wd θ)`, where
     `M = 1/(√v̂ + ε)` is the preconditioner and the momentum `m̂` is about 90% past gradients.

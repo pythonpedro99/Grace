@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from gaf.env import GROUPS, ClipEnv, EnvCfg
-from gaf.gate import FloorGate, floor_probe
+from gaf.gate import FloorGate, excess_basis, floor_probe
 from gaf.grads import SplitAdamW, project
 from gaf.models import sigreg_slices
 from gaf.train import ARMS, Cfg, premise, run, run_gt
@@ -63,8 +63,11 @@ def test_sigreg_matches_lewm_reference():
 
 
 def test_premise_slow_satisfies_sigreg():
-    s = premise(EnvCfg(n_slow=16), D=16)
-    assert s["slow"] < 3 * s["gaussian"] + 1 and s["fast+hard"] > 5 * s["slow"]
+    tight = premise(EnvCfg(n_slow=16), D=16)  # slow alone is an isotropic Gaussian
+    assert tight["slow"] < 3 * tight["gaussian"] + 1 and tight["fast+hard"] > 5 * tight["slow"]
+    roomy = premise(EnvCfg(n_slow=16), D=32)  # linear slow content leaves room ...
+    assert roomy["slow"] > 30 * roomy["gaussian"]
+    assert roomy["slow+copies"] < 10 * roomy["gaussian"]  # ... that nonlinear copies can fill
 
 
 @pytest.mark.parametrize("metric", [None, "rand"])
@@ -123,6 +126,18 @@ def test_dynamics_need_actions():
     assert r["fast"] < 0.35 and r["hard"] < 0.15 and r["slow"] > 0.8
 
 
+def test_excess_basis_finds_unlearned_direction():
+    """Noise (high floor, P at the floor) and learned content rank low; the direction where the
+    predictor is far above its floor ranks first, although the floor alone cannot tell it apart."""
+    R = torch.linalg.qr(torch.randn(4, 4, generator=torch.Generator().manual_seed(0)))[0]
+    C_star = R @ torch.diag(torch.tensor([1.0, 0.0, 0.0, 0.0])) @ R.T  # dir 0: noise floor
+    C_P = R @ torch.diag(torch.tensor([1.0, 0.5, 0.0, 0.0])) @ R.T  # dir 1: not learned yet
+    Q, lam = excess_basis(C_P, C_star, delta=0.01)
+    assert torch.allclose(Q.T @ Q, torch.eye(4), atol=1e-5)
+    assert abs(torch.dot(Q[:, 0], R[:, 1])) > 0.999 and lam[0] == pytest.approx(50, rel=1e-3)
+    assert lam[1] == pytest.approx(1.0, abs=0.02)  # noise: predictor at its floor
+
+
 def test_gate_hysteresis_and_floor():
     g = FloorGate(2, "cpu", window=1, eps_g=0.1, eps_f=1.0, delta=0.0, min_dwell=3)
     L = torch.tensor([1.0, 1.0])
@@ -176,7 +191,8 @@ def test_floor_probe_finds_noise_floor():
 def test_tiny_run(arm, tmp_path):
     cfg = Cfg(arm=arm, env=SMALL, D=8, steps=40, batch=32, floor_start=10, floor_every=10,
               floor_steps=10, floor_pool=256, eval_every=20, diag_every=5, min_dwell=2,
-              window=5, basis="resid" if arm == "both" else "dim", probe_n=256, mlp_n=512,
+              window=5, basis={"both": "resid", "context": "dim"}.get(arm, "excess"),
+              probe_n=256, mlp_n=512,
               mlp_steps=20)
     s = run(cfg, tmp_path, verbose=False)
     f = s["final"]

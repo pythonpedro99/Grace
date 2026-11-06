@@ -98,18 +98,16 @@ def baseline_verdict(tab, keep=0.8, drop=0.3) -> pd.DataFrame:
                          for a in tab.index if a in BASELINES}).T
 
 
-def fix_verdict(tab, ref="sg", gain=0.3, slack=0.1, slow_min=0.5) -> pd.DataFrame:
-    """Fix vs. its reference: fast and hard gain >= `gain`, noise within `slack`, slow kept.
-
-    Slow is checked against an absolute floor, not against `ref`: with n_slow >= D the slow
-    factors alone fill the latent, so keeping the sprites must cost some slow R^2.
-    """
+def fix_verdict(tab, ref="sg", gain=0.3, slack=0.1, slow_slack=0.1) -> pd.DataFrame:
+    """Fix vs. its reference: fast and hard gain >= `gain`, noise within `slack` of `ref`,
+    slow within `slow_slack` of `ref`. In the tight regime (D = n_slow) slow content alone fills
+    the latent and keeping the sprites must cost slow R^2: use a larger `slow_slack` there."""
     r = tab.loc[ref]
     return pd.DataFrame({a: {
         f"fast +{gain}": tab.loc[a, "r2_fast"] - r.r2_fast >= gain,
         f"hard +{gain}": tab.loc[a, "r2_hard"] - r.r2_hard >= gain,
         f"noise <= {ref} + {slack}": tab.loc[a, "r2_noise"] <= r.r2_noise + slack,
-        f"slow >= {slow_min}": tab.loc[a, "r2_slow"] >= slow_min,
+        f"slow >= {ref} - {slow_slack}": tab.loc[a, "r2_slow"] >= r.r2_slow - slow_slack,
     } for a in tab.index if a in FIXES}).T
 
 
@@ -122,15 +120,16 @@ def _content(enc, env, Q, n=8192):
                      for g in GROUPS], 1)
 
 
-def floors_of(cfg: Cfg, out, steps=3000, basis="resid") -> pd.DataFrame:
+def floors_of(cfg: Cfg, out, steps=3000, basis="excess") -> pd.DataFrame:
     """Floor probe on the final encoder of a finished run, with per-direction content.
 
     One row per latent direction: floor L*_j, and the R^2 of z_j from each group.
     """
     torch.manual_seed(cfg.seed + 777)
-    enc, _, tgt = load_model(cfg, out)
+    enc, P, tgt = load_model(cfg, out)
     env = ClipEnv(cfg.env, device())
-    Ls, Q, _ = floor_probe(enc, tgt, env, steps=steps, basis=basis)
+    Ls, Q, _ = floor_probe(enc, tgt, env, steps=steps, lr=cfg.lr, wd=cfg.wd, basis=basis,
+                           pred=P, delta=cfg.delta)
     c = _content(enc, env, Q)
     d = pd.DataFrame(c, columns=list(GROUPS))
     d.insert(0, "floor", Ls.cpu().numpy())
