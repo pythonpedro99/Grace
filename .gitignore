@@ -4,3 +4,4 @@ __pycache__/
 .ruff_cache/
 .ipynb_checkpoints/
 results/
+.DS_Store

@@ -82,7 +82,8 @@ def table(df, cols=None, by="arm", **where) -> pd.DataFrame:
 
 def diag_table(df, **where) -> pd.DataFrame:
     """Leak diagnostics of the final eval window per arm (seed mean)."""
-    cols = [c for c in ("n_S", "leak_pos", "leak_cos", "proj_ratio", "lreal_S", "lreal_open",
+    cols = [c for c in ("n_S", "leak_pos", "leak_cos", "leak_cos_post", "proj_ratio", "lreal_S",
+                        "lreal_open",
                         "wb_ratio", "rank_dz", "rank_z", "sigreg") if c in df]
     return table(df, cols, **where)
 
@@ -97,14 +98,18 @@ def baseline_verdict(tab, keep=0.8, drop=0.3) -> pd.DataFrame:
                          for a in tab.index if a in BASELINES}).T
 
 
-def fix_verdict(tab, ref="sg", gain=0.3, slack=0.1) -> pd.DataFrame:
-    """Fix vs. its reference: fast and hard gain >= `gain`, noise and slow within `slack`."""
+def fix_verdict(tab, ref="sg", gain=0.3, slack=0.1, slow_min=0.5) -> pd.DataFrame:
+    """Fix vs. its reference: fast and hard gain >= `gain`, noise within `slack`, slow kept.
+
+    Slow is checked against an absolute floor, not against `ref`: with n_slow >= D the slow
+    factors alone fill the latent, so keeping the sprites must cost some slow R^2.
+    """
     r = tab.loc[ref]
     return pd.DataFrame({a: {
         f"fast +{gain}": tab.loc[a, "r2_fast"] - r.r2_fast >= gain,
         f"hard +{gain}": tab.loc[a, "r2_hard"] - r.r2_hard >= gain,
         f"noise <= {ref} + {slack}": tab.loc[a, "r2_noise"] <= r.r2_noise + slack,
-        f"slow >= {ref} - {slack}": tab.loc[a, "r2_slow"] >= r.r2_slow - slack,
+        f"slow >= {slow_min}": tab.loc[a, "r2_slow"] >= slow_min,
     } for a in tab.index if a in FIXES}).T
 
 
@@ -117,7 +122,7 @@ def _content(enc, env, Q, n=8192):
                      for g in GROUPS], 1)
 
 
-def floors_of(cfg: Cfg, out, steps=3000, basis="dim") -> pd.DataFrame:
+def floors_of(cfg: Cfg, out, steps=3000, basis="resid") -> pd.DataFrame:
     """Floor probe on the final encoder of a finished run, with per-direction content.
 
     One row per latent direction: floor L*_j, and the R^2 of z_j from each group.
@@ -125,7 +130,7 @@ def floors_of(cfg: Cfg, out, steps=3000, basis="dim") -> pd.DataFrame:
     torch.manual_seed(cfg.seed + 777)
     enc, _, tgt = load_model(cfg, out)
     env = ClipEnv(cfg.env, device())
-    Ls, Q = floor_probe(enc, tgt, env, steps=steps, basis=basis)
+    Ls, Q, _ = floor_probe(enc, tgt, env, steps=steps, basis=basis)
     c = _content(enc, env, Q)
     d = pd.DataFrame(c, columns=list(GROUPS))
     d.insert(0, "floor", Ls.cpu().numpy())

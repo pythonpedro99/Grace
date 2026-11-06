@@ -9,6 +9,8 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+from .env import ACT_DIM
+
 
 def mlp(d_in: int, d_out: int, hidden: int = 256) -> nn.Sequential:
     return nn.Sequential(nn.Linear(d_in, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
@@ -36,14 +38,14 @@ class Encoder(nn.Module):
 
 
 class Predictor(nn.Module):
-    """Context latents (n, T-1, D) -> predicted target latent (n, D)."""
+    """Context latents (n, T-1, D) and actions (n, T-1, act_dim) -> target latent (n, D)."""
 
-    def __init__(self, D: int, T: int = 3, hidden: int = 256):
+    def __init__(self, D: int, T: int = 3, act_dim: int = ACT_DIM, hidden: int = 256):
         super().__init__()
-        self.net = mlp((T - 1) * D, D, hidden)
+        self.net = mlp((T - 1) * (D + act_dim), D, hidden)
 
-    def forward(self, zc):
-        return self.net(zc.flatten(1))
+    def forward(self, zc, a):
+        return self.net(torch.cat([zc.flatten(1), a.flatten(1)], 1))
 
 
 @torch.no_grad()

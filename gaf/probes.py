@@ -56,7 +56,7 @@ def probe_suite(enc, P, env, Q=None, n=8192, enc_tgt=None):
     zc, zt = encode(enc, clip.x[:, :-1]), encode(enc_tgt, clip.x[:, -1])
     z_last = zt if enc_tgt is enc else encode(enc, clip.x[:, -1])
     z_all = torch.cat([zc, z_last[:, None]], 1)  # online encoder on every frame
-    p = P(zc)
+    p = P(zc, clip.a)
     enc.train(was)
     Q = torch.eye(zt.shape[1], device=zt.device) if Q is None else Q
     row, content = {}, []

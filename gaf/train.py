@@ -14,7 +14,11 @@ Encoder gradient of every arm (one-pager section 7), all built from the same pie
     detached   none                 none             encoder sees only SIGReg: noise floors
     target     g_ctx                g_open           fix on the target path only
     context    g'_ctx (projected)   none             fix on the context path only
-    both       g'_ctx (projected)   g_open           full method
+    both       projected            g_open           full method (g_open projected too)
+
+The predictor sees the context latents and the actions. The encoder steps with SplitAdamW
+(grads.py): exactly AdamW, but the projection acts on the context side of the update that is
+actually applied (momentum and weight decay included), in Adam's metric.
 """
 import json
 import time
@@ -28,9 +32,9 @@ import pandas as pd
 import torch
 from torch.func import functional_call, jvp
 
-from .env import GROUPS, ClipEnv, EnvCfg
+from .env import ACT_DIM, GROUPS, ClipEnv, EnvCfg
 from .gate import FloorGate, floor_probe
-from .grads import adam_metric, assign, project, vjp
+from .grads import SplitAdamW, vjp
 from .models import Encoder, Predictor, ema_, frozen_copy, sigreg
 from .probes import mlp_probe, probe_suite, r2
 
@@ -56,9 +60,11 @@ class Cfg:
     lr: float = 1e-3
     lam: float = 0.1  # SIGReg weight
     n_slices: int = 256
-    opt: str = "adam"  # adam | sgd
-    precond: bool = True  # with adam: measure and project the leak in Adam's diagonal metric
+    opt: str = "adamw"  # adamw | sgd (encoder: SplitAdamW, see grads.py)
+    wd: float = 0.01  # decoupled weight decay (encoder and predictor)
     alpha: float = 1.0  # projection strength
+    proj_on: str = "update"  # update: the applied AdamW step | grad: the raw gradient (sketch)
+    proj_open: bool = True  # also project the open target path (it shares weights with S)
     tau_lag: float = 0.99  # lagged predictor P_lag = EMA(P)
     tau_ema: float = 0.996  # target encoder of the ema arm
     # gate (section 4)
@@ -68,7 +74,7 @@ class Cfg:
     delta: float = 0.01  # floor offset: e = (L - L*) / (L* + delta)
     min_dwell: int = 500
     soft: bool = False  # soft open-path weights 1 - clip(gap / gap_ref)
-    basis: str = "dim"  # dim | resid (eigenbasis of the floor probe's residual)
+    basis: str = "resid"  # resid: eigenbasis of the floor probe's residual | dim: latent dims
     # floor (section 3)
     floor_start: int = 500
     floor_every: int = 1000  # N
@@ -76,6 +82,7 @@ class Cfg:
     floor_pool: int = 16384
     floor_keep: int = 3  # L* = min over the last floor_keep refreshes ...
     floor_margin: float = 0.1  # ... times (1 - margin)
+    floor_warm: bool = True  # keep training the same probe across refreshes (budget accumulates)
     # logging
     eval_every: int = 500
     diag_every: int = 50
@@ -121,34 +128,36 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
     tgt_enc = enc_ema or enc
     params, names = list(enc.parameters()), [n for n, _ in enc.named_parameters()]
     p_params = list(P.parameters())
-    Opt = (lambda ps: torch.optim.Adam(ps, cfg.lr)) if cfg.opt == "adam" else \
-        (lambda ps: torch.optim.SGD(ps, cfg.lr))
-    opt_e, opt_p = Opt(params), Opt(p_params)
+    sgd = cfg.opt == "sgd"
+    opt_e = SplitAdamW(params, cfg.lr, wd=cfg.wd, sgd=sgd)
+    opt_p = (torch.optim.SGD(p_params, cfg.lr, weight_decay=cfg.wd) if sgd
+             else torch.optim.AdamW(p_params, cfg.lr, weight_decay=cfg.wd))
     gate = FloorGate(D, dev, cfg.window, cfg.eps_g, cfg.eps_f, cfg.delta, cfg.min_dwell,
                      cfg.floor_keep, cfg.floor_margin, cfg.soft)
-    acc, rows, dirs, floors = defaultdict(list), [], defaultdict(list), []
+    acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
     has_tgt_path = tgt_mode != "ema" and ctx_mode != "none"
     t0 = time.time()
 
     for step in range(cfg.steps):
         if _is_floor_step(cfg, step):
-            Ls, Q = floor_probe(enc, tgt_enc, env, cfg.floor_steps, cfg.floor_pool,
-                                basis=cfg.basis)
+            Ls, Q, pr = floor_probe(enc, tgt_enc, env, cfg.floor_steps, cfg.floor_pool,
+                                    lr=cfg.lr, wd=cfg.wd, basis=cfg.basis, probe=probe)
+            probe = pr if cfg.floor_warm else None
             gate.set_floor(Ls, None if cfg.basis == "dim" else Q)
             floors.append((step, Ls.cpu()))
         diag = step % cfg.diag_every == 0
         clip = env.sample(N)
-        xc, xt = clip.x[:, :-1], clip.x[:, -1]
+        xc, xt, a = clip.x[:, :-1], clip.x[:, -1], clip.a
         zc, zt = enc(xc), enc(xt)  # (N, T-1, D), (N, D); separate passes keep the paths apart
         if enc_ema is not None:
             with torch.no_grad():
                 zt_d = enc_ema(xt)
         else:
             zt_d = zt.detach()
-        p = P(zc.detach() if ctx_mode == "none" else zc)
+        p = P(zc.detach() if ctx_mode == "none" else zc, a)
         L = (p - zt_d).pow(2).mean()  # (1/D) sum_j L_j: LeWM's MSE scale
         with torch.no_grad():
-            gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach()) - zt_d))
+            gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach(), a) - zt_d))
         sig = cfg.lam * sigreg(torch.cat([zc.transpose(0, 1), zt[None]]), cfg.n_slices)
 
         # derivatives w.r.t. the latents (cheap), then encoder VJPs per path
@@ -165,55 +174,48 @@ def run(cfg: Cfg, out, verbose: bool = True) -> dict:
         z_open = ds_dzt
         if tgt_mode == "all":
             z_open = z_open + d_tgt(torch.ones(D, device=dev))
-        elif tgt_mode == "open":
-            z_open = z_open + d_tgt(gate.w_open())
 
+        g_rest = vjp([zc, zt], [ds_dzc, z_open], params)  # SIGReg (+ target path of lewm)
+        g_ctx = vjp(zc, dL_dzc, params) if ctx_mode != "none" else torch.zeros_like(g_rest)
+        if tgt_mode == "open":  # its step moves z_t on S too (shared weights): project it as well
+            g_open = vjp(zt, d_tgt(gate.w_open()), params)
+            if ctx_mode == "proj" and cfg.proj_open:
+                g_ctx = g_ctx + g_open
+            else:
+                g_rest = g_rest + g_open
         need_S = has_tgt_path and (ctx_mode == "proj" or diag)
-        g_ctx_applied = None
-        if ctx_mode == "none":
-            g = vjp([zc, zt], [ds_dzc, z_open], params)
-        elif not need_S:
-            g = vjp([zc, zt], [dL_dzc + ds_dzc, z_open], params)
-        else:
-            metric = adam_metric(opt_e, params) if cfg.opt == "adam" and cfg.precond else None
-            g_ctx = vjp(zc, dL_dzc, params)
-            g_S = vjp(zt, d_tgt(gate.w_S()), params)
-            alpha = cfg.alpha if ctx_mode == "proj" else 0.0
-            g_ctx_applied, ell = project(g_ctx, g_S, alpha, metric)
-            g = g_ctx_applied + vjp([zc, zt], [ds_dzc, z_open], params)
-            if diag:
-                m = 1.0 if metric is None else metric
-                nS, nc = torch.dot(g_S, m * g_S).sqrt(), torch.dot(g_ctx, m * g_ctx).sqrt()
-                acc["leak_pos"].append(float(ell > 0))
-                acc["leak_cos"].append(ell / (nS * nc).clamp_min(1e-30).item())
-                acc["proj_ratio"].append((g_ctx_applied.norm() / g_ctx.norm().clamp_min(1e-30)
-                                          ).item())
-                # per-direction first-order leak of the applied context step, via one JVP
-                tangent = -cfg.lr * (metric if metric is not None else 1.0) * g_ctx_applied
-                tang, i = [], 0
-                for prm in params:
-                    tang.append(tangent[i:i + prm.numel()].view_as(prm))
-                    i += prm.numel()
-                _, dz = jvp(lambda *ps: functional_call(enc, dict(zip(names, ps, strict=True)),
-                                                        (xt,)),
-                            tuple(prm.detach() for prm in params), tuple(tang))
-                leak = (2 * (p.detach() - zt_d) @ Qb * (dz @ Qb)).mean(0)
-                acc["leak_jvp"].append(leak.cpu())
-
-        assign(params, g)
+        g_S = vjp(zt, d_tgt(gate.w_S()), params) if need_S else None
+        old = [prm.detach().clone() for prm in params] if diag and has_tgt_path else None
+        info = opt_e.step(g_ctx, g_rest, g_S, cfg.alpha if ctx_mode == "proj" else 0.0,
+                          cfg.proj_on)
         for prm, gp in zip(p_params, gP, strict=True):
             prm.grad = gp
-        opt_e.step()
         opt_p.step()
         ema_(P_lag, P, cfg.tau_lag)
         if enc_ema is not None:
             ema_(enc_ema, enc, cfg.tau_ema)
 
+        if diag and has_tgt_path:
+            u = info["u_ctx"]
+            acc["leak_pos"].append(float(info["leak_pre"] > 0))
+            acc["leak_cos"].append(info["leak_cos"])
+            acc["leak_cos_post"].append(info["leak_post"] / (g_S.norm() * u.norm()
+                                                             ).clamp_min(1e-30).item())
+            acc["proj_ratio"].append(info["proj_ratio"])
+            # per-direction first-order leak of the applied context step, via one JVP at theta
+            tangent, tang, i = -cfg.lr * u, [], 0
+            for prm in params:
+                tang.append(tangent[i:i + prm.numel()].view_as(prm))
+                i += prm.numel()
+            _, dz = jvp(lambda *ps: functional_call(enc, dict(zip(names, ps, strict=True)), (xt,)),
+                        tuple(old), tuple(tang))
+            acc["leak_jvp"].append((2 * ((p.detach() - zt_d) @ Qb) * (dz @ Qb)).mean(0).cpu())
+
         acc["loss"].append(L.item())
         acc["sigreg"].append(sig.item() / cfg.lam)
         if diag:  # exact check: l_real = L(theta', z_t(theta)) - L(theta', z_t(theta'))
             with torch.no_grad():
-                p2 = P(enc(xc))
+                p2 = P(enc(xc), a)
                 lreal = gate.per_dir(p2 - zt_d) - gate.per_dir(p2 - tgt_enc(xt))
             acc["lreal"].append(lreal.cpu())
             acc["lreal_S"].append((lreal * gate.w_S()).sum().item())
@@ -273,23 +275,26 @@ def load_model(cfg: Cfg, out):
 
 
 # ---- checks that need no encoder --------------------------------------------------------------
-def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0) -> pd.DataFrame:
-    """Learnability on ground truth: a predictor from the true context factors to the true
-    target factors. Held-out R^2 per group over steps (slow fast, hard slower, noise ~0)."""
+def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0,
+           actions=True) -> pd.DataFrame:
+    """Learnability on ground truth: a predictor from the true context factors (and actions)
+    to the true target factors. Held-out R^2 per group over steps (slow fast, hard slower,
+    noise ~0). actions=False hides the actions: fast and hard should then become unpredictable,
+    which confirms that they are action-conditioned."""
     dev = device()
     torch.manual_seed(seed)
     env = ClipEnv(env_cfg, dev)
     cols = env.group_cols()
 
     def xy(clip):
-        x = torch.cat([torch.cat([clip.f[g][:, t] for g in GROUPS], -1)
-                       for t in range(env_cfg.T - 1)], -1)
-        return x, env.factors(clip)
+        x = torch.cat([clip.f[g][:, :-1] for g in GROUPS], -1).flatten(1)
+        a = clip.a.flatten(1) if actions else torch.zeros_like(clip.a.flatten(1))
+        return torch.cat([x, a], 1), env.factors(clip)
 
     d_in = sum(env.dims.values())
-    net = torch.nn.Sequential(torch.nn.Linear(d_in * (env_cfg.T - 1), 256), torch.nn.GELU(),
-                              torch.nn.Linear(256, 256), torch.nn.GELU(),
-                              torch.nn.Linear(256, d_in)).to(dev)
+    net = torch.nn.Sequential(
+        torch.nn.Linear((d_in + ACT_DIM) * (env_cfg.T - 1), 256), torch.nn.GELU(),
+        torch.nn.Linear(256, 256), torch.nn.GELU(), torch.nn.Linear(256, d_in)).to(dev)
     opt = torch.optim.Adam(net.parameters(), 1e-3)
     xt, yt = xy(env.sample(8192))
     rows = []

@@ -3,15 +3,17 @@
     slow   n_slow smooth colour patterns, amplitudes follow an OU process (rho close to 1).
            Gaussian across clips, so they alone can satisfy SIGReg while being trivially
            predictable: the shortcut the encoder can collapse onto.
-    fast   a sprite moving with constant velocity per clip, wrapping around (torus).
-           Deterministic; needs both context frames (p2 = 2 p1 - p0).
-    hard   a sprite on a chaotic circle map q' = k q + c (mod 1), c per clip.
-           Deterministic but harder to learn (q2 = (k+1) q1 - k q0, a higher-degree map).
+    fast   a sprite pushed by the action: p' = p + v_act a (mod 1, a torus).
+           Deterministic given the action; unpredictable without it.
+    hard   a sprite on an action-driven chaotic circle map q' = k q + h_act a (mod 1).
+           Deterministic given the action but harder to learn (degree-k map in the latent).
     noise  n_noise patterns of the same kind as slow, resampled every frame. Unpredictable:
            the only content that should be dropped.
 
-Frames 0..T-2 are context, frame T-1 is the target. The pattern bases (slow and noise
-together) are orthonormal in pixel space, so every pattern factor is linearly decodable.
+Actions a_t in [-1, 1]^2 (uniform random policy) act between frames t and t+1; the predictor
+sees all T-1 of them. Frames 0..T-2 are context, frame T-1 is the target. The pattern bases
+(slow and noise together) are orthonormal in pixel space, so every pattern factor is linearly
+decodable.
 """
 import math
 from dataclasses import dataclass
@@ -20,6 +22,7 @@ from typing import NamedTuple
 import torch
 
 GROUPS = ("slow", "fast", "hard", "noise")
+ACT_DIM = 2
 
 
 @dataclass(frozen=True)
@@ -29,8 +32,10 @@ class EnvCfg:
     n_slow: int = 16
     slow_rho: float = 0.98  # per-frame OU coefficient of the slow amplitudes
     n_noise: int = 8
-    v_max: float = 0.12  # fast sprite speed per axis, in image widths per frame
+    v_act: float = 0.3  # fast sprite: displacement per unit action, in image widths
+    # without the action, R^2 of e(p') from e(p) is capped at (sin(2 pi v) / (2 pi v))^2: 0.25
     hard_k: int = 2  # hard sprite map multiplier (2 = doubling map, higher = harder)
+    h_act: float = 0.4  # hard sprite: displacement per unit action (no-action cap 0.05)
     sprite_sigma: float = 0.06  # sprite radius in image widths
     a_slow: float = 1.0  # pixel RMS of the slow part
     a_noise: float = 1.0  # pixel RMS of the noise part
@@ -43,9 +48,8 @@ class EnvCfg:
 
 class Clip(NamedTuple):
     x: torch.Tensor  # (n, T, 3, res, res)
+    a: torch.Tensor  # (n, T-1, 2) actions; a[:, t] acts between frames t and t+1
     f: dict  # group -> (n, T, d_group) ground-truth factors per frame
-    v: torch.Tensor  # (n, 2) fast-sprite velocity
-    c: torch.Tensor  # (n, 2) hard-sprite offset
 
 
 def _emb(p: torch.Tensor) -> torch.Tensor:
@@ -105,22 +109,20 @@ class ClipEnv:
                      * torch.randn(n, c.n_slow, device=dev))
         s = torch.stack(s, 1)  # (n, T, n_slow)
         noise = torch.randn(n, T, c.n_noise, device=dev)
-        v = (2 * torch.rand(n, 2, device=dev) - 1) * c.v_max
-        p = [torch.rand(n, 2, device=dev)]
-        cc = torch.rand(n, 2, device=dev)
-        q = [torch.rand(n, 2, device=dev)]
-        for _ in range(T - 1):
-            p.append((p[-1] + v) % 1)
-            q.append((c.hard_k * q[-1] + cc) % 1)
+        a = 2 * torch.rand(n, T - 1, ACT_DIM, device=dev) - 1
+        p, q = [torch.rand(n, 2, device=dev)], [torch.rand(n, 2, device=dev)]
+        for t in range(T - 1):
+            p.append((p[-1] + c.v_act * a[:, t]) % 1)
+            q.append((c.hard_k * q[-1] + c.h_act * a[:, t]) % 1)
         p, q = torch.stack(p, 1), torch.stack(q, 1)  # (n, T, 2)
 
         x = s @ self.B_slow + noise @ self.B_noise  # (n, T, 3 res^2)
         x = x.view(n, T, 3, c.res, c.res)
-        for a, col, pos in ((c.a_fast, self.col_fast, p), (c.a_hard, self.col_hard, q)):
-            x = x + a * col[:, None, None] * _bump(pos, c.res, c.sprite_sigma)[:, :, None]
+        for amp, col, pos in ((c.a_fast, self.col_fast, p), (c.a_hard, self.col_hard, q)):
+            x = x + amp * col[:, None, None] * _bump(pos, c.res, c.sprite_sigma)[:, :, None]
         x = x + c.pixel_noise * torch.randn_like(x)
         f = {"slow": s, "fast": _emb(p), "hard": _emb(q), "noise": noise}
-        return Clip(x, f, v, cc)
+        return Clip(x, a, f)
 
     def factors(self, clip: Clip, t: int = -1) -> torch.Tensor:
         """All groups at frame t, concatenated in GROUPS order: (n, sum of dims)."""

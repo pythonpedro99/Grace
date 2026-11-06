@@ -7,9 +7,9 @@ import torch
 
 from gaf.env import GROUPS, ClipEnv, EnvCfg
 from gaf.gate import FloorGate, floor_probe
-from gaf.grads import project
+from gaf.grads import SplitAdamW, project
 from gaf.models import sigreg_slices
-from gaf.train import ARMS, Cfg, premise, run
+from gaf.train import ARMS, Cfg, premise, run, run_gt
 
 SMALL = EnvCfg(res=16)
 
@@ -27,10 +27,11 @@ def test_env_dynamics():
     torch.manual_seed(0)
     c = env.sample(2000)
     assert c.x.shape == (2000, 3, 3, 32, 32)
-    p, q = _angles(c.f["fast"]), _angles(c.f["hard"])
-    assert _circ(p[:, 2], 2 * p[:, 1] - p[:, 0]).max() < 1e-3  # constant velocity
-    k = env.cfg.hard_k
-    assert _circ(q[:, 2], (k + 1) * q[:, 1] - k * q[:, 0]).max() < 1e-3  # chaotic map
+    assert c.a.shape == (2000, 2, 2) and c.a.abs().max() <= 1
+    p, q, e = _angles(c.f["fast"]), _angles(c.f["hard"]), env.cfg
+    for t in range(2):  # action-driven dynamics
+        assert _circ(p[:, t + 1], p[:, t] + e.v_act * c.a[:, t]).max() < 1e-3
+        assert _circ(q[:, t + 1], e.hard_k * q[:, t] + e.h_act * c.a[:, t]).max() < 1e-3
     s, n = c.f["slow"], c.f["noise"]
     rho = torch.corrcoef(torch.stack([s[:, 0].flatten(), s[:, 1].flatten()]))[0, 1]
     assert abs(rho - env.cfg.slow_rho) < 0.02
@@ -82,6 +83,46 @@ def test_projection_removes_leak(metric, alpha):
     assert torch.equal(g_same, -g_c)
 
 
+def _params(seed=0):
+    torch.manual_seed(seed)
+    return [torch.nn.Parameter(torch.randn(5, 3)), torch.nn.Parameter(torch.randn(4))]
+
+
+def test_split_adamw_is_adamw_without_projection():
+    ps, ref = _params(), _params()
+    opt, opt_ref = SplitAdamW(ps, 1e-2, wd=0.1), torch.optim.AdamW(ref, 1e-2, weight_decay=0.1)
+    for k in range(5):
+        g = torch.randn(19, generator=torch.Generator().manual_seed(k))
+        opt.step(0.3 * g, 0.7 * g)  # split arbitrarily: momentum is linear
+        ref[0].grad, ref[1].grad = g[:15].view(5, 3).clone(), g[15:].clone()
+        opt_ref.step()
+    assert all(torch.allclose(a, b, atol=1e-6) for a, b in zip(ps, ref, strict=True))
+
+
+@pytest.mark.parametrize("alpha", [1.0, 0.5])
+def test_split_adamw_projection_controls_actual_step(alpha):
+    """The leak of the applied context update (momentum and weight decay included) is
+    (1 - alpha) times the leak before projection."""
+    ps = _params()
+    opt = SplitAdamW(ps, 1e-2, wd=0.1)
+    gen = torch.Generator().manual_seed(1)
+    for _ in range(4):
+        g_S = torch.randn(19, generator=gen)
+        g_ctx = g_S + torch.randn(19, generator=gen)  # correlated: leaks
+        info = opt.step(g_ctx, torch.randn(19, generator=gen), g_S, alpha)
+        if info["leak_pre"] > 0:
+            tol = 1e-5 * info["leak_pre"]
+            assert info["leak_post"] == pytest.approx((1 - alpha) * info["leak_pre"], abs=tol)
+            assert torch.dot(g_S, info["u_ctx"]).item() == pytest.approx(info["leak_post"],
+                                                                        abs=tol)
+
+
+def test_dynamics_need_actions():
+    """Without the actions, fast and hard stay near their caps (0.25, 0.05); slow does not."""
+    r = run_gt(SMALL, steps=300, eval_every=300, actions=False).iloc[-1]
+    assert r["fast"] < 0.35 and r["hard"] < 0.15 and r["slow"] > 0.8
+
+
 def test_gate_hysteresis_and_floor():
     g = FloorGate(2, "cpu", window=1, eps_g=0.1, eps_f=1.0, delta=0.0, min_dwell=3)
     L = torch.tensor([1.0, 1.0])
@@ -125,7 +166,8 @@ def test_floor_probe_finds_noise_floor():
     cfg = EnvCfg(res=16, n_slow=4, n_noise=4, a_noise=1.0, a_fast=0, a_hard=0, pixel_noise=0)
     env = ClipEnv(cfg, "cpu")
     torch.manual_seed(0)
-    Ls, _ = floor_probe(_Oracle(env), _Oracle(env), env, steps=300, n_pool=2048)
+    Ls, _, _ = floor_probe(_Oracle(env), _Oracle(env), env, steps=300, n_pool=2048,
+                           basis="dim")
     slow, noise = Ls[:4], Ls[4:]
     assert slow.max() < 0.15 and noise.min() > 0.5 * noise.max() > 0.3
 
@@ -139,6 +181,6 @@ def test_tiny_run(arm, tmp_path):
     s = run(cfg, tmp_path, verbose=False)
     f = s["final"]
     assert all(math.isfinite(f[f"r2_{g}"]) for g in GROUPS)
-    if arm in ("context", "both"):
-        assert 0 <= f["leak_pos"] <= 1 and f["proj_ratio"] <= 1 + 1e-5
+    if arm in ("context", "both"):  # projection is M-orthogonal: the Euclidean norm may grow
+        assert 0 <= f["leak_pos"] <= 1 and math.isfinite(f["proj_ratio"])
     assert json.loads((tmp_path / cfg.run_id / "summary.json").read_text())["run_id"] == cfg.run_id

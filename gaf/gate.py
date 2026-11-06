@@ -101,40 +101,42 @@ class FloorGate:
 
 @torch.no_grad()
 def encode_pool(enc_ctx, enc_tgt, env, n: int, chunk: int = 2048):
-    """Latents of n fresh clips: context (n, T-1, D), target (n, D), and the clips' factors."""
-    zc, zt, fs = [], [], []
+    """n fresh clips: context latents (n, T-1, D), actions (n, T-1, A), target latents (n, D)."""
+    zc, a, zt = [], [], []
     for i in range(0, n, chunk):
         clip = env.sample(min(chunk, n - i))
         zc.append(enc_ctx(clip.x[:, :-1]))
+        a.append(clip.a)
         zt.append(enc_tgt(clip.x[:, -1]))
-        fs.append(env.factors(clip))
-    return torch.cat(zc), torch.cat(zt), torch.cat(fs)
+    return torch.cat(zc), torch.cat(a), torch.cat(zt)
 
 
-def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1e-3,
-                basis="dim", hidden=256):
-    """Floor L*_j: a fresh predictor on frozen snapshots of the encoder(s).
+def floor_probe(enc_ctx, enc_tgt, env, steps=1500, n_pool=16384, batch=512, lr=1e-3, wd=0.0,
+                basis="resid", hidden=256, probe=None):
+    """Floor L*_j: a predictor trained on frozen snapshots of the encoder(s).
 
-    Returns (Lstar (D,), Q (D, D)) on held-out clips. basis="dim": Q = I. basis="resid":
-    Q = eigenvectors of the probe's held-out residual covariance (largest error first), a
-    data-defined basis that separates noisy from predictable directions.
+    Trained with AdamW(lr, wd) like the predictor, so P and the probe can reach the same error.
+    Returns (Lstar (D,), Q (D, D), probe), scored on held-out clips. `probe`: warm start from a
+    previous probe (its budget accumulates over refreshes); None trains a fresh one.
+    basis="dim": Q = I. basis="resid": Q = eigenvectors of the probe's held-out residual
+    covariance, largest error first: noisy directions separate from predictable ones.
     """
     enc_ctx, enc_tgt = frozen_copy(enc_ctx), frozen_copy(enc_tgt)
-    zc, zt, _ = encode_pool(enc_ctx, enc_tgt, env, n_pool)
+    zc, a, zt = encode_pool(enc_ctx, enc_tgt, env, n_pool)
     n_tr = int(0.75 * len(zt))
     D, T = zt.shape[1], zc.shape[1] + 1
-    probe = Predictor(D, T, hidden).to(zt.device)
-    opt = torch.optim.Adam(probe.parameters(), lr)
+    probe = probe if probe is not None else Predictor(D, T, a.shape[-1], hidden).to(zt.device)
+    opt = torch.optim.AdamW(probe.parameters(), lr, weight_decay=wd)
     for _ in range(steps):
         i = torch.randint(0, n_tr, (batch,), device=zt.device)
-        loss = (probe(zc[i]) - zt[i]).pow(2).mean()
+        loss = (probe(zc[i], a[i]) - zt[i]).pow(2).mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
     with torch.no_grad():
-        r = probe(zc[n_tr:]) - zt[n_tr:]
+        r = probe(zc[n_tr:], a[n_tr:]) - zt[n_tr:]
     if basis == "resid":
         Q = torch.linalg.eigh(r.T @ r / len(r))[1].flip(-1)
     else:
         Q = torch.eye(D, device=zt.device)
-    return (r @ Q).pow(2).mean(0), Q
+    return (r @ Q).pow(2).mean(0), Q, probe
