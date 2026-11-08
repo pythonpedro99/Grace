@@ -186,6 +186,13 @@ One seed, 7 runs, all with early evals:
   predictor needs more than 2000 steps behind a plateau, while the encoder prunes content within about 100.
   Tests: `detached` runs with `swap_colors` (3 seeds, 3000 steps), and `A.latent_learning` on the seed-1
   `detached` encoder after 5000 steps.
+- **colour or doubling map?** (stage 7g): results so far show hard is available (seed 1: 0.32), the predictor
+  learns it (frozen latents: about 2000 steps, plateau 0.18; during the head start 0.26 at step 5000), the gate
+  opens (`n_S` = 0 from step 3000), and hard is pruned within 50–400 steps of the switch, while fast at a similar
+  predictive R² is reinforced to 0.99. The colour swap showed availability follows colour (white sprite
+  appears early). Runs with a head start of 5000: white hard sprite with `k=2` (`both` seeds 0, 1, `sg` seed 1) and
+  white hard sprite with `k=1` (`both`, `sg`, seed 1). Hypothesis for the pruning: the doubling map amplifies
+  errors in the encoded position, so the prediction gradient prunes hard instead of sharpening it.
 - Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
 Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a
