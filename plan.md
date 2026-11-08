@@ -168,11 +168,18 @@ variance in the context latents is noise for it, and the context-path gradient (
 leaves alone as legitimate learning) prunes it from the shared encoder. The target loses it too, so nothing
 is left to learn. The lagged target of `ema` keeps the sprites available long enough.
 
-One seed, 8 runs, all with early evals:
+One seed, 7 runs, all with early evals:
 - **early** (`sg`, `ema`, `detached`, `both`, 3000 steps): when and how fast the sprites vanish.
-- **lag** (`ema` with τ = 0.9, 0.99; 6000 steps): how much lag in the target is enough.
 - **head start** (`sg`, `both` with `head_start=3000`, 8000 steps): does a predictor head start keep them.
+- **block** (20k steps): the encoder is trained on the prediction loss restricted to the open directions,
+  through both the context and the target path, while the predictor still trains on all directions. This
+  applies the one-pager's rule ("in learning directions only the predictor reduces the loss") to the
+  context path as well, instead of projecting only the target-side leak. While nothing has a floor yet,
+  the whole latent is protected and the encoder gets only SIGReg, so `block` starts with a built-in
+  head start of 500 steps (tested: identical to `detached` until the first floor). Risk: the encoder
+  step for the open directions can still move the protected ones through the shared weights.
 - **leak by source** (`lk_*` columns in all of them): does the remaining exact leak come from SIGReg.
+- Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
 Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a
 schedule, not a better gradient rule. Candidates if not: anchoring S to a lagged encoder, or freezing the

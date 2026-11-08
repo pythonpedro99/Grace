@@ -65,6 +65,7 @@ projected).
 | `target` | `g_ctx` | `g_open` | fix, target side only |
 | `context` | projected | none | fix, context side only |
 | `both` | projected | `g_open`, projected too | the full method (§7) |
+| `block` | masked to the open directions | `g_open` | experimental: the encoder gets the prediction loss only in the open directions, through both paths |
 
 Every arm runs the same optimizer, gate and diagnostics, so the leak can be compared across arms.
 

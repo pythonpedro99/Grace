@@ -19,12 +19,13 @@ from .train import Cfg, device, load_model, run
 
 BASELINES = ("lewm", "sg", "ema")
 FIXES = ("target", "context", "both")
+FIXES_ALL = (*FIXES, "block")  # block: masked loss on both paths, single seed so far
 R2 = [f"r2_{g}" for g in GROUPS]
 
 # Fixed colour per arm (reference categorical palette, light mode): colour follows the arm,
 # never its position in a chart. At most four arms share a chart.
 COLOR = {"sg": "#2a78d6", "both": "#eb6834", "context": "#1baf7a", "target": "#eda100",
-         "lewm": "#e87ba4", "ema": "#008300", "detached": "#6250d6"}
+         "lewm": "#e87ba4", "ema": "#008300", "detached": "#6250d6", "block": "#e34948"}
 GROUP_COLOR = dict(zip(GROUPS, ("#2a78d6", "#eb6834", "#1baf7a", "#eda100"), strict=True))
 INK, MUTED, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 plt.rcParams.update({"axes.spines.top": False, "axes.spines.right": False,
@@ -195,7 +196,7 @@ def table(df, cols=None, by="arm", **where) -> pd.DataFrame:
     """Seed mean (± sem in a second frame) of `cols` per arm, for runs matching `where`."""
     cols = cols or R2 + [f"mlp_r2_{g}" for g in GROUPS]
     d = select(df, **where).groupby(by)[cols]
-    order = [a for a in (*BASELINES, "detached", *FIXES) if a in d.groups]
+    order = [a for a in (*BASELINES, "detached", *FIXES_ALL) if a in d.groups]
     return d.mean().reindex(order or None).round(3)
 
 
@@ -227,7 +228,7 @@ def fix_verdict(tab, ref="sg", gain=0.3, slack=0.1, slow_slack=0.1) -> pd.DataFr
         f"hard +{gain}": tab.loc[a, "r2_hard"] - r.r2_hard >= gain,
         f"noise <= {ref} + {slack}": tab.loc[a, "r2_noise"] <= r.r2_noise + slack,
         f"slow >= {ref} - {slow_slack}": tab.loc[a, "r2_slow"] >= r.r2_slow - slow_slack,
-    } for a in tab.index if a in FIXES}).T
+    } for a in tab.index if a in FIXES_ALL}).T
 
 
 # ---- floors -----------------------------------------------------------------------------------

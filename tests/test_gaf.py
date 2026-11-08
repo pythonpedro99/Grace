@@ -288,3 +288,18 @@ def test_early_eval_and_leak_decomposition(tmp_path):
     snap = snapshot(df, tmp_path, runs, steps=(0, 5, 10), cols=("r2_fast",))
     assert snap.loc["both", ["fast@0", "fast@5", "fast@10"]].notna().all()  # early + regular evals
     assert trace(df, tmp_path, runs) is not None
+
+
+def test_block_is_detached_while_everything_is_protected(tmp_path):
+    """No floor yet: every direction is in S, so the masked loss sends the encoder nothing and
+    only SIGReg shapes it, exactly as in `detached` (the predictor trains the same way)."""
+    kw = {**TINY, "floor_start": 1000}
+    ids = {}
+    for arm in ("block", "detached"):
+        cfg = Cfg(arm=arm, **kw)
+        run(cfg, tmp_path, verbose=False)
+        ids[arm] = torch.load(tmp_path / cfg.run_id / "model.pt")
+    for k, v in ids["block"]["enc"].items():
+        assert torch.allclose(v, ids["detached"]["enc"][k], atol=1e-6), k
+    for k, v in ids["block"]["P"].items():
+        assert torch.allclose(v, ids["detached"]["P"][k], atol=1e-6), k

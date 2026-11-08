@@ -15,6 +15,8 @@ Encoder gradient of every arm (one-pager section 7), all built from the same pie
     target     g_ctx                g_open           fix on the target path only
     context    g'_ctx (projected)   none             fix on the context path only
     both       projected            g_open           full method (g_open projected too)
+    block      masked to open dirs  g_open           loss gradient to the encoder only in the open
+                                                     directions, through both paths (no projection)
 
 The predictor sees the context latents and the actions. The encoder steps with SplitAdamW
 (grads.py): exactly AdamW, but the projection acts on the context side of the update that is
@@ -47,6 +49,7 @@ ARMS = {  # arm: (context path, target path)
     "target": ("raw", "open"),
     "context": ("proj", "none"),
     "both": ("proj", "open"),
+    "block": ("mask", "open"),
 }
 
 
@@ -191,6 +194,9 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         ins = p_params + ([zc] if ctx_m != "none" else [])
         gs = torch.autograd.grad(L, ins, retain_graph=True)
         gP, dL_dzc = gs[:len(p_params)], (gs[-1] if ctx_m != "none" else None)
+        if ctx_m == "mask":  # the encoder learns from the open directions only; P still from all
+            L_enc = ((p - zt_d) @ gate.Q).pow(2).mul(gate.w_open()).mean()
+            dL_dzc = torch.autograd.grad(L_enc, zc, retain_graph=True)[0]
         ds_dzc, ds_dzt = torch.autograd.grad(sig, [zc, zt], retain_graph=True)
         Qb = gate.Q
         rt = (zt_d - p.detach()) @ Qb  # target residual in the gate basis
