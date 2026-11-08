@@ -91,11 +91,21 @@ class Cfg:
     mlp_n: int = 20000  # final MLP probe: training clips
     mlp_steps: int = 1000
     tag: str = ""  # free text, e.g. the name of an ablation
+    # added later: part of the run id only when set, so earlier run ids stay valid
+    head_start: int = 0  # steps in which the encoder gets only SIGReg while the predictor trains
+    early_eval: tuple = ()  # extra probe evals at these steps (before the update), in early.csv
 
     @property
     def run_id(self) -> str:
-        h = sha1(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()[:8]
+        d = asdict(self)
+        for k, default in _LATE_FIELDS.items():
+            if d[k] == default:
+                del d[k]
+        h = sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
         return f"{self.arm}_s{self.seed}_{h}"
+
+
+_LATE_FIELDS = {"head_start": 0, "early_eval": ()}
 
 
 def device() -> str:
@@ -108,7 +118,8 @@ def _is_floor_step(c: Cfg, step: int) -> bool:
 
 
 def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
-    """Train one arm. Writes <out>/<run_id>/{metrics.csv, dirs.npz, model.pt, summary.json}.
+    """Train one arm. Writes <out>/<run_id>/{metrics.csv, dirs.npz, model.pt, summary.json}
+    (and early.csv when cfg.early_eval is set).
 
     Finished runs (summary.json present) are skipped and their summary returned.
     on_step(steps_done, phase) is called every step (phase "train") and when a longer phase
@@ -138,12 +149,20 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     gate = FloorGate(D, dev, cfg.window, cfg.eps_g, cfg.eps_f, cfg.delta, cfg.min_dwell,
                      cfg.floor_keep, cfg.floor_margin, cfg.soft)
     acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
-    has_tgt_path = tgt_mode != "ema" and ctx_mode != "none"
+    early, early_at = [], set(cfg.early_eval)
     t0 = time.time()
 
     for step in range(cfg.steps):
         if on_step:
             on_step(step, "train")
+        # head start: the encoder sees only SIGReg, the predictor trains on detached latents
+        ctx_m, tgt_m = ("none", "none") if step < cfg.head_start else (ctx_mode, tgt_mode)
+        has_tgt_path = tgt_m != "ema" and ctx_m != "none"
+        if step in early_at:
+            if on_step:
+                on_step(step, "eval")
+            m0, _ = probe_suite(enc, P, env, gate.Q, cfg.probe_n, enc_tgt=enc_ema)
+            early.append({"step": step, "n_S": int(gate.inS.sum()), **m0})
         if _is_floor_step(cfg, step):
             if on_step:
                 on_step(step, "floor probe")
@@ -162,16 +181,16 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                 zt_d = enc_ema(xt)
         else:
             zt_d = zt.detach()
-        p = P(zc.detach() if ctx_mode == "none" else zc, a)
+        p = P(zc.detach() if ctx_m == "none" else zc, a)
         L = (p - zt_d).pow(2).mean()  # (1/D) sum_j L_j: LeWM's MSE scale
         with torch.no_grad():
             gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach(), a) - zt_d))
         sig = cfg.lam * sigreg(torch.cat([zc.transpose(0, 1), zt[None]]), cfg.n_slices)
 
         # derivatives w.r.t. the latents (cheap), then encoder VJPs per path
-        ins = p_params + ([zc] if ctx_mode != "none" else [])
+        ins = p_params + ([zc] if ctx_m != "none" else [])
         gs = torch.autograd.grad(L, ins, retain_graph=True)
-        gP, dL_dzc = gs[:len(p_params)], (gs[-1] if ctx_mode != "none" else None)
+        gP, dL_dzc = gs[:len(p_params)], (gs[-1] if ctx_m != "none" else None)
         ds_dzc, ds_dzt = torch.autograd.grad(sig, [zc, zt], retain_graph=True)
         Qb = gate.Q
         rt = (zt_d - p.detach()) @ Qb  # target residual in the gate basis
@@ -180,21 +199,21 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             return 2 * (rt * w) @ Qb.T / (N * D)
 
         z_open = ds_dzt
-        if tgt_mode == "all":
+        if tgt_m == "all":
             z_open = z_open + d_tgt(torch.ones(D, device=dev))
 
         g_rest = vjp([zc, zt], [ds_dzc, z_open], params)  # SIGReg (+ target path of lewm)
-        g_ctx = vjp(zc, dL_dzc, params) if ctx_mode != "none" else torch.zeros_like(g_rest)
-        if tgt_mode == "open":  # its step moves z_t on S too (shared weights): project it as well
+        g_ctx = vjp(zc, dL_dzc, params) if ctx_m != "none" else torch.zeros_like(g_rest)
+        if tgt_m == "open":  # its step moves z_t on S too (shared weights): project it as well
             g_open = vjp(zt, d_tgt(gate.w_open()), params)
-            if ctx_mode == "proj" and cfg.proj_open:
+            if ctx_m == "proj" and cfg.proj_open:
                 g_ctx = g_ctx + g_open
             else:
                 g_rest = g_rest + g_open
-        need_S = has_tgt_path and (ctx_mode == "proj" or diag)
+        need_S = has_tgt_path and (ctx_m == "proj" or diag)
         g_S = vjp(zt, d_tgt(gate.w_S()), params) if need_S else None
         old = [prm.detach().clone() for prm in params] if diag and has_tgt_path else None
-        info = opt_e.step(g_ctx, g_rest, g_S, cfg.alpha if ctx_mode == "proj" else 0.0,
+        info = opt_e.step(g_ctx, g_rest, g_S, cfg.alpha if ctx_m == "proj" else 0.0,
                           cfg.proj_on)
         for prm, gp in zip(p_params, gP, strict=True):
             prm.grad = gp
@@ -218,6 +237,19 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             _, dz = jvp(lambda *ps: functional_call(enc, dict(zip(names, ps, strict=True)), (xt,)),
                         tuple(old), tuple(tang))
             acc["leak_jvp"].append((2 * ((p.detach() - zt_d) @ Qb) * (dz @ Qb)).mean(0).cpu())
+            # exact leak by source: move only the context part / only the rest (SIGReg, open
+            # target path) of the applied step and measure how the target's error changes with
+            # the predictor held fixed; positive = that part makes z_t easier to predict
+            with torch.no_grad():
+                for part, upd in (("ctx", u), ("rest", info["u_rest"])):
+                    moved, off = {}, 0
+                    for n_, p0 in zip(names, old, strict=True):
+                        moved[n_] = p0 - cfg.lr * upd[off:off + p0.numel()].view_as(p0)
+                        off += p0.numel()
+                    zt_part = functional_call(enc, moved, (xt,))
+                    lk = gate.per_dir(p.detach() - zt_d) - gate.per_dir(p.detach() - zt_part)
+                    acc[f"lk_{part}_S"].append((lk * gate.w_S()).sum().item())
+                    acc[f"lk_{part}_open"].append((lk * (1 - gate.w_S())).sum().item())
 
         acc["loss"].append(L.item())
         acc["sigreg"].append(sig.item() / cfg.lam)
@@ -261,6 +293,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": time.time() - t0,
                "final": rows[-1], **mlp_probe(enc, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps)}
     pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
+    if early:
+        pd.DataFrame(early).to_csv(odir / "early.csv", index=False)
     np.savez(odir / "dirs.npz", step=np.array([r["step"] for r in rows]),
              floor_step=np.array([s for s, _ in floors]),
              floor=np.stack([f.numpy() for _, f in floors]) if floors else np.zeros((0, D)),

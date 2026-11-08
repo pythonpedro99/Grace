@@ -60,8 +60,8 @@ class SplitAdamW:
     @torch.no_grad()
     def step(self, g_ctx, g_rest, g_S=None, alpha=0.0, proj_on="update") -> dict:
         """Apply one step. Returns diagnostics: leak before / after projection, the cosine of
-        g_S and the context update, the norm ratio after / before, and the applied context
-        update u_ctx (the parameter step of the context side is -lr * u_ctx)."""
+        g_S and the context update, the norm ratio after / before, and the applied updates
+        u_ctx and u_rest (the parameter step is -lr * (u_ctx + u_rest))."""
         self.t += 1
         th = parameters_to_vector(self.params)
         b1 = 0.0 if self.sgd else self.b1
@@ -92,9 +92,10 @@ class SplitAdamW:
         self.m_ctx = m_raw
         self.m_rest = b1 * self.m_rest + (1 - b1) * g_rest
         u_ctx = u_of(self.m_ctx)
+        u_rest = M * self.m_rest / bc
         if g_S is not None:
             out["leak_post"] = torch.dot(g_S, u_ctx).item()
             out["proj_ratio"] = (u_ctx.norm() / u_pre.norm().clamp_min(1e-30)).item()
-        out["u_ctx"] = u_ctx
-        vector_to_parameters(th - self.lr * (u_ctx + M * self.m_rest / bc), self.params)
+        out["u_ctx"], out["u_rest"] = u_ctx, u_rest
+        vector_to_parameters(th - self.lr * (u_ctx + u_rest), self.params)
         return out

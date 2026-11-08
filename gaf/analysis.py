@@ -166,6 +166,21 @@ def history(out, run_id) -> pd.DataFrame:
     return pd.read_csv(Path(out) / run_id / "metrics.csv")
 
 
+def early(out, run_id) -> pd.DataFrame:
+    """Extra evals of a run with cfg.early_eval (empty frame if it has none)."""
+    p = Path(out) / run_id / "early.csv"
+    return pd.read_csv(p) if p.exists() else pd.DataFrame(columns=["step"])
+
+
+def curve(df, out, sel: dict) -> pd.DataFrame:
+    """Metrics over steps of the run(s) matching `sel` (cfg fields): early evals merged with
+    the regular ones, averaged over matching runs. One row per step."""
+    ids = select(df, **sel).run_id
+    assert len(ids), f"no finished run matches {sel}"
+    h = pd.concat(pd.concat([early(out, r), history(out, r)]) for r in ids)
+    return h.groupby("step").mean(numeric_only=True)
+
+
 def dirs(out, run_id) -> dict:
     return dict(np.load(Path(out) / run_id / "dirs.npz"))
 
@@ -187,7 +202,7 @@ def table(df, cols=None, by="arm", **where) -> pd.DataFrame:
 def diag_table(df, **where) -> pd.DataFrame:
     """Leak diagnostics of the final eval window per arm (seed mean)."""
     cols = [c for c in ("n_S", "leak_pos", "leak_cos", "leak_cos_post", "proj_ratio", "lreal_S",
-                        "lreal_open",
+                        "lreal_open", "lk_ctx_S", "lk_rest_S", "lk_ctx_open", "lk_rest_open",
                         "wb_ratio", "rank_dz", "rank_z", "sigreg") if c in df]
     return table(df, cols, **where)
 
@@ -331,6 +346,41 @@ def floor_scatter(fl: pd.DataFrame):
 def leak_panel(df, out, arms, **where):
     """Leak over training: share of steps with ell > 0, and l_real on S vs. open directions."""
     return curves(df, out, arms, cols=["leak_pos", "lreal_S", "lreal_open", "n_S"], **where)
+
+
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]  # fixed order, one colour per line
+
+
+def trace(df, out, runs: dict, cols=("r2_fast", "r2_hard", "r2_noise", "r2_slow"), xlog=True):
+    """One panel per metric, one line per entry of `runs` ({label: cfg selector}, <= 4 lines).
+
+    Early evals are merged in, so the first few hundred steps are resolved. xlog: symlog x axis
+    (linear below step 50) to see the start of training.
+    """
+    assert len(runs) <= len(SERIES), "at most four lines per chart"
+    cur = {lab: curve(df, out, sel) for lab, sel in runs.items()}
+    fig, axes = plt.subplots(1, len(cols), figsize=(3.6 * len(cols), 3.3), layout="constrained",
+                             squeeze=False)
+    for ax, col in zip(axes[0], cols, strict=True):
+        for (lab, c), color in zip(cur.items(), SERIES, strict=False):
+            ax.plot(c.index, c[col], color=color, label=lab, marker="o", ms=3, lw=1.6)
+        ax.set(title=col.replace("r2_", ""), xlabel="step")
+        if xlog:
+            ax.set_xscale("symlog", linthresh=50)
+    axes[0, 0].set_ylabel("ridge R² from z_t" if cols[0].startswith("r2_") else cols[0])
+    axes[0, -1].legend(loc="best", fontsize=8)
+    return fig
+
+
+def snapshot(df, out, runs: dict, steps=(0, 50, 100, 200, 500, 1000, 3000),
+             cols=("r2_fast", "r2_hard", "r2_noise", "r2_slow")) -> pd.DataFrame:
+    """Values of `cols` at given steps, one row per entry of `runs` (NaN where not evaluated)."""
+    rows = {}
+    for lab, sel in runs.items():
+        c = curve(df, out, sel)
+        rows[lab] = {f"{col.replace('r2_', '')}@{s}": c[col].get(s, np.nan)
+                     for col in cols for s in steps}
+    return pd.DataFrame(rows).T
 
 
 def show_clips(env_cfg, n=4):

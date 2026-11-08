@@ -155,6 +155,29 @@ noise.
 Candidates for later: controllability as an extra protection rule (it targets the probe-bias risk for
 hard), SFA as a diagnostic, and an S defined as a subspace instead of per-direction state.
 
+## Hypothesis: the sprites are lost in a race (notebook stage 7)
+
+Result of `results_v1` (3 seeds): `lewm` keeps only slow content; `sg` and all three fixes also lose fast
+and hard; `ema` keeps and learns fast in 2 of 3 seeds (0.99), not hard; `both` drops noise (0.10) with slow
+intact. At the first eval (step 500) `sg`, `context`, `target` and `both` are identical: before the first
+floor everything is protected, the open path is closed, and the projection changes the update by under
+0.2%. The sprites are already gone, while `detached` still has them (fast 0.33).
+
+Hypothesis: the predictor needs about 700 (fast) and 2100 (hard) steps to learn a sprite. Until then, sprite
+variance in the context latents is noise for it, and the context-path gradient (the part the projection
+leaves alone as legitimate learning) prunes it from the shared encoder. The target loses it too, so nothing
+is left to learn. The lagged target of `ema` keeps the sprites available long enough.
+
+One seed, 8 runs, all with early evals:
+- **early** (`sg`, `ema`, `detached`, `both`, 3000 steps): when and how fast the sprites vanish.
+- **lag** (`ema` with τ = 0.9, 0.99; 6000 steps): how much lag in the target is enough.
+- **head start** (`sg`, `both` with `head_start=3000`, 8000 steps): does a predictor head start keep them.
+- **leak by source** (`lk_*` columns in all of them): does the remaining exact leak come from SIGReg.
+
+Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a
+schedule, not a better gradient rule. Candidates if not: anchoring S to a lagged encoder, or freezing the
+encoder's effect on S in the update.
+
 ## Open
 - **Not run on a GPU yet.** Only CPU tests and a tiny dry run of the notebook have run.
   `eps_g`, `eps_f`, `delta` and `min_dwell` are first guesses.

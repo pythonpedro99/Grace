@@ -68,6 +68,10 @@ projected).
 
 Every arm runs the same optimizer, gate and diagnostics, so the leak can be compared across arms.
 
+`head_start=K` (any arm): for the first K steps the encoder gets only SIGReg while the predictor
+trains on the detached latents; then the arm switches on. It tests whether the sprites are lost in a
+race against the predictor (notebook stage 7).
+
 ## The method
 
 - **Floor L\*_j (§3), `gate.floor_probe`:**
@@ -133,6 +137,12 @@ Every arm runs the same optimizer, gate and diagnostics, so the leak can be comp
     (`leak_jvp`).
   - The exact check is `ℓ_real = L(θ′, z_t(θ)) − L(θ′, z_t(θ′))`, summed over S and over the open
     directions (`lreal_S`, `lreal_open`).
+- **Leak by source:** `lk_ctx_S`, `lk_rest_S` (and `_open`): at diagnostic steps, only the context
+  part or only the rest (SIGReg, open target path) of the applied step is applied to the encoder, and the
+  target's error is measured with the predictor held fixed. Positive means that part makes `z_t`
+  easier to predict.
+- **Early evals:** `early_eval=(0, 25, 50, …)` adds probe evaluations at those steps, written to
+  `early.csv` (`A.curve`, `A.trace` and `A.snapshot` merge them with the regular ones).
 - **Gate state per direction over training:** `gap`, `excess`, `L`, `Lstar`, `inS`, in `dirs.npz`.
 
 ## Run it

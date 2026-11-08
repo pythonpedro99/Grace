@@ -256,3 +256,35 @@ def test_parallel_execute_reports_failures(tmp_path):
     with pytest.raises(RuntimeError, match="1 run"):
         execute([good, bad], tmp_path, workers=2, progress=False)
     assert (tmp_path / good.run_id / "summary.json").exists()  # the other run still finished
+
+
+def test_new_fields_keep_old_run_ids():
+    """head_start / early_eval join the hash only when set: finished runs stay valid."""
+    assert Cfg(arm="sg").run_id == "sg_s0_f6d8b336"  # ids recorded before the fields existed
+    assert Cfg(arm="both", seed=2, D=16, tag="x").run_id == "both_s2_a39c1fae"
+    assert Cfg(arm="sg", head_start=100).run_id != Cfg(arm="sg").run_id
+    assert Cfg(arm="sg", early_eval=(0, 5)).run_id != Cfg(arm="sg").run_id
+
+
+def test_head_start_switches_the_encoder_off(tmp_path):
+    """During the head start the encoder gets only SIGReg: no target path, no leak diagnostics."""
+    off = run(Cfg(arm="sg", head_start=10, **TINY), tmp_path, verbose=False)["final"]
+    on = run(Cfg(arm="sg", **TINY), tmp_path, verbose=False)["final"]
+    assert "leak_cos" not in off and "leak_cos" in on
+
+
+def test_early_eval_and_leak_decomposition(tmp_path):
+    import matplotlib
+    matplotlib.use("Agg")
+    from gaf.analysis import collect, snapshot, trace
+    cfg = Cfg(arm="both", early_eval=(0, 5), **TINY)
+    f = run(cfg, tmp_path, verbose=False)["final"]
+    keys = ("lk_ctx_S", "lk_rest_S", "lk_ctx_open", "lk_rest_open")
+    assert all(math.isfinite(f[k]) for k in keys)
+    early = __import__("pandas").read_csv(tmp_path / cfg.run_id / "early.csv")
+    assert early.step.tolist() == [0, 5] and "r2_fast" in early
+    df = collect(tmp_path)
+    runs = {"both": dict(arm="both")}
+    snap = snapshot(df, tmp_path, runs, steps=(0, 5, 10), cols=("r2_fast",))
+    assert snap.loc["both", ["fast@0", "fast@5", "fast@10"]].notna().all()  # early + regular evals
+    assert trace(df, tmp_path, runs) is not None
