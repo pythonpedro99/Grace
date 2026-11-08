@@ -179,6 +179,8 @@ One seed, 7 runs, all with early evals:
   head start of 500 steps (tested: identical to `detached` until the first floor). Risk: the encoder
   step for the open directions can still move the protected ones through the shared weights.
 - **leak by source** (`lk_*` columns in all of them): does the remaining exact leak come from SIGReg.
+- **hard, seed 1** (stage 7e): seed 0 never builds hard content under SIGReg alone, seed 1 does (detached
+  ridge R² 0.27 at step 2000). `sg` and `both` with `head_start=5000` (12k steps) and `block` (20k steps).
 - Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
 Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a
