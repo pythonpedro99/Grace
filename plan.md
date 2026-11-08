@@ -181,6 +181,11 @@ One seed, 7 runs, all with early evals:
 - **leak by source** (`lk_*` columns in all of them): does the remaining exact leak come from SIGReg.
 - **hard, seed 1** (stage 7e): seed 0 never builds hard content under SIGReg alone, seed 1 does (detached
   ridge R² 0.27 at step 2000). `sg` and `both` with `head_start=5000` (12k steps) and `block` (20k steps).
+- **why hard is late** (stage 7f): hypothesis of two bottlenecks. Availability: hard enters the SIGReg-shaped
+  latent late and seed-dependently (perhaps a colour/salience effect: fast white, hard red). Learn time: a
+  predictor needs more than 2000 steps behind a plateau, while the encoder prunes content within about 100.
+  Tests: `detached` runs with `swap_colors` (3 seeds, 3000 steps), and `A.latent_learning` on the seed-1
+  `detached` encoder after 5000 steps.
 - Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
 Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a

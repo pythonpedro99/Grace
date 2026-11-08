@@ -47,6 +47,7 @@ class EnvCfg:
     pixel_noise: float = 0.05
     max_freq: int = 3  # highest spatial frequency of the patterns
     seed: int = 0  # fixes the patterns and sprite colours
+    swap_colors: bool = False  # fast sprite red and hard sprite white, instead of the reverse
 
 
 class Clip(NamedTuple):
@@ -99,8 +100,8 @@ class ClipEnv:
                         ).to(device)
         self.Q = Q.to(device)  # unit-norm bases, used by the oracle encoder in tests
         cols = torch.tensor([[1.0, 1.0, 1.0], [1.0, -0.6, -0.6]])  # fast: white, hard: red
-        self.col_fast, self.col_hard = (cols / cols.norm(dim=1, keepdim=True) * math.sqrt(3)
-                                        ).to(device)
+        cols = (cols / cols.norm(dim=1, keepdim=True) * math.sqrt(3)).to(device)
+        self.col_fast, self.col_hard = cols.flip(0) if cfg.swap_colors else cols
         self.dims = {"slow": cfg.n_slow, "fast": 4, "hard": 4, "noise": cfg.n_noise}
 
     @torch.no_grad()

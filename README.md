@@ -48,7 +48,7 @@ against ≈ 1 for a true Gaussian and ≈ 230 for slow content alone. The tight 
 slow content alone is an exact isotropic Gaussian, is its own notebook stage (4b).
 
 Knobs: `n_slow`, `slow_rho`, `n_noise`, `v_act`, `h_act` (action strength), `hard_k`
-(difficulty), `a_*` (salience), `pixel_noise`, `res`, `T`.
+(difficulty), `a_*` (salience), `swap_colors` (fast red / hard white), `pixel_noise`, `res`, `T`.
 
 ## Arms (`gaf/train.py`)
 
@@ -144,6 +144,9 @@ race against the predictor (notebook stage 7).
   easier to predict.
 - **Early evals:** `early_eval=(0, 25, 50, …)` adds probe evaluations at those steps, written to
   `early.csv` (`A.curve`, `A.trace` and `A.snapshot` merge them with the regular ones).
+- **Learn time in latent space:** `A.latent_learning(cfg, out)` freezes the encoder of a finished
+  run, trains a fresh predictor on its latents and returns the held-out R² of each group over
+  predictor steps, plus how available each group is in the latent (`.attrs["availability"]`).
 - **Gate state per direction over training:** `gap`, `excess`, `L`, `Lstar`, `inS`, in `dirs.npz`.
 
 ## Run it

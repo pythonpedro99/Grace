@@ -303,3 +303,20 @@ def test_block_is_detached_while_everything_is_protected(tmp_path):
         assert torch.allclose(v, ids["detached"]["enc"][k], atol=1e-6), k
     for k, v in ids["block"]["P"].items():
         assert torch.allclose(v, ids["detached"]["P"][k], atol=1e-6), k
+
+
+def test_swap_colors_swaps_the_sprites():
+    a, b = ClipEnv(EnvCfg(), "cpu"), ClipEnv(EnvCfg(swap_colors=True), "cpu")
+    assert torch.equal(a.col_fast, b.col_hard) and torch.equal(a.col_hard, b.col_fast)
+    assert torch.allclose(b.col_fast.norm(), b.col_hard.norm())  # same energy, only colour differs
+    assert Cfg(arm="sg", env=EnvCfg(swap_colors=True)).run_id != Cfg(arm="sg").run_id
+
+
+def test_latent_learning(tmp_path):
+    from gaf.analysis import latent_learning
+    cfg = Cfg(arm="detached", **TINY)
+    run(cfg, tmp_path, verbose=False)
+    res = latent_learning(cfg, tmp_path, steps=20, eval_every=10, n_eval=256, batch=32)
+    assert res.index.tolist() == [10, 20]
+    assert {"slow", "fast", "hard", "noise", "mse"} <= set(res.columns)
+    assert res.notna().all().all() and set(res.attrs["availability"]) == set(GROUPS)

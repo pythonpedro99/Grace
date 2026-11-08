@@ -102,13 +102,17 @@ class Cfg:
     def run_id(self) -> str:
         d = asdict(self)
         for k, default in _LATE_FIELDS.items():
-            if d[k] == default:
+            if tuple(d[k]) == default if isinstance(d[k], (list, tuple)) else d[k] == default:
                 del d[k]
+        for k, default in _LATE_ENV_FIELDS.items():
+            if d["env"].get(k) == default:
+                d["env"].pop(k, None)
         h = sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:8]
         return f"{self.arm}_s{self.seed}_{h}"
 
 
 _LATE_FIELDS = {"head_start": 0, "early_eval": ()}
+_LATE_ENV_FIELDS = {"swap_colors": False}
 
 
 def device() -> str:
