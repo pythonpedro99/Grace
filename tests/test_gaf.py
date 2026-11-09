@@ -320,3 +320,43 @@ def test_latent_learning(tmp_path):
     assert res.index.tolist() == [10, 20]
     assert {"slow", "fast", "hard", "noise", "mse"} <= set(res.columns)
     assert res.notna().all().all() and set(res.attrs["availability"]) == set(GROUPS)
+
+
+def _refmap(live_err, lag_gain, n=4000, seed=0):
+    """Shadow latents of 4 dims: 0, 1 predictable (residual 0.05), 2, 3 noise (residual 1)."""
+    from gaf.retain import RefMap
+    g = torch.Generator().manual_seed(seed)
+    ref = RefMap(4, "cpu", tau=0.0, every=1, eps_g=0.02, eps_f=0.1)
+    z = torch.randn(n, 4, generator=g)
+    r = torch.randn(n, 4, generator=g) * torch.tensor([0.05, 0.05, 1.0, 1.0]) ** 0.5
+    r_lag = r * (1 + lag_gain)  # the lagged copy is worse by this factor while still improving
+    e_live = torch.randn(n, 4, generator=g) * torch.tensor(live_err) ** 0.5
+    ref.update(z, r, r_lag, e_live)
+    return ref
+
+
+def test_refmap_separates_noise_without_labels():
+    ref = _refmap([1.0, 1.0, 1.0, 1.0], lag_gain=0.0)  # settled; live predictor far behind
+    order = ref.rho.argsort(descending=True)
+    assert ref.rho[order[:2]].min() > 0.9 and ref.rho[order[2:]].max() < 0.1
+    assert ref.w[order[:2]].min() > 0.9 and ref.w[order[2:]].max() < 0.1  # keep signal, free noise
+
+
+def test_refmap_releases_when_the_live_predictor_catches_up():
+    ref = _refmap([0.05, 0.05, 1.0, 1.0], lag_gain=0.0)  # live error = shadow floor
+    assert ref.w.max() < 0.1  # predictable content is released, noise was free already
+    assert torch.allclose(ref.M, ref.M.T, atol=1e-6)
+
+
+def test_refmap_retains_everything_while_the_shadow_still_learns():
+    ref = _refmap([0.05, 0.05, 1.0, 1.0], lag_gain=0.5)  # shadow predictor still improving
+    assert ref.w.min() > 0.9  # unsettled: retained, whatever rho says (protect by default)
+
+
+@pytest.mark.parametrize(("arm", "rec"), [("retain", 1.0), ("retain_open", 1.0), ("retain", 0.0)])
+def test_retention_arms_run_and_log_the_reference(arm, rec, tmp_path):
+    cfg = Cfg(arm=arm, shadow_rec=rec, ret_every=5, **TINY)
+    f = run(cfg, tmp_path, verbose=False)["final"]
+    for k in ("ret_loss", "shadow_loss", "ref_w", "ref_rho", "sh_r2_slow", "sh_r2_fast"):
+        assert math.isfinite(f[k]), k
+    assert 0 <= f["ref_w"] <= 1 and "ref_rho_noise" in f and "ref_rho_pred" in f

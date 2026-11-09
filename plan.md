@@ -193,6 +193,12 @@ One seed, 7 runs, all with early evals:
   appears early). Runs with a head start of 5000: white hard sprite with `k=2` (`both` seeds 0, 1, `sg` seed 1) and
   white hard sprite with `k=1` (`both`, `sg`, seed 1). Hypothesis for the pruning: the doubling map amplifies
   errors in the encoded position, so the prediction gradient prunes hard instead of sharpening it.
+- **reference-gated retention** (stage 8, `docs/reference_gated_retention.md`): the proposed unsupervised fix.
+  A shadow encoder (SIGReg + reconstruction, never shaped by prediction) and a shadow predictor give a reference
+  floor in a space the live encoder cannot damage; the live encoder is asked to keep the shadow latent's
+  predictable part readable (retention loss) until its own predictor has caught up, and directions that are settled
+  and unpredictable are free (noise). Arms `retain` and `retain_open`. Six runs of 12k steps; success criteria are
+  written in the notebook before the results.
 - Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
 Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a

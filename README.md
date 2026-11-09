@@ -66,6 +66,8 @@ projected).
 | `context` | projected | none | fix, context side only |
 | `both` | projected | `g_open`, projected too | the full method (§7) |
 | `block` | masked to the open directions | `g_open` | experimental: the encoder gets the prediction loss only in the open directions, through both paths |
+| `retain` | `g_ctx` + retention | none | experimental, unsupervised: reference-gated retention alone (`docs/reference_gated_retention.md`) |
+| `retain_open` | `g_ctx` + retention | `g_open` | the same plus the floor-gated open path that removes noise |
 
 Every arm runs the same optimizer, gate and diagnostics, so the leak can be compared across arms.
 
@@ -187,6 +189,7 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
 
     gaf/env.py       clip world with actions (EnvCfg, ClipEnv)
     gaf/models.py    CNN encoder (GroupNorm, no BatchNorm), action predictor, SIGReg (LeWM-verified)
+    gaf/retain.py    RefMap: reference floor and retention weights of reference-gated retention
     gaf/gate.py      FloorGate (gap, excess, hysteresis, basis rotation), floor_probe
     gaf/grads.py     flat VJPs, leak projection, SplitAdamW
     gaf/probes.py    ridge / MLP probes, probing suite

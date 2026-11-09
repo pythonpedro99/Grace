@@ -37,6 +37,27 @@ class Encoder(nn.Module):
         return self.head(self.conv(x.reshape(-1, *x.shape[-3:]))).view(*lead, -1)
 
 
+class Decoder(nn.Module):
+    """(..., D) -> (..., 3, res, res). Reconstruction head of the shadow encoder."""
+
+    def __init__(self, D: int, res: int = 32, width: int = 32):
+        super().__init__()
+        self.w, self.r = 2 * width, res // 8
+        self.fc = nn.Sequential(nn.Linear(D, 256), nn.GELU(),
+                                nn.Linear(256, self.w * self.r**2), nn.GELU())
+
+        def up(i, o):
+            return [nn.ConvTranspose2d(i, o, 4, 2, 1), nn.GroupNorm(8, o), nn.GELU()]
+
+        self.net = nn.Sequential(*up(self.w, self.w), *up(self.w, width),
+                                 nn.ConvTranspose2d(width, 3, 4, 2, 1))
+
+    def forward(self, z):
+        lead = z.shape[:-1]
+        h = self.fc(z.reshape(-1, z.shape[-1])).view(-1, self.w, self.r, self.r)
+        return self.net(h).view(*lead, 3, self.r * 8, self.r * 8)
+
+
 class Predictor(nn.Module):
     """Context latents (n, T-1, D) and actions (n, T-1, act_dim) -> target latent (n, D)."""
 

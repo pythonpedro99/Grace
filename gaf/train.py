@@ -38,8 +38,9 @@ from tqdm.auto import tqdm
 from .env import ACT_DIM, GROUPS, ClipEnv, EnvCfg
 from .gate import FloorGate, floor_probe
 from .grads import SplitAdamW, vjp
-from .models import Encoder, Predictor, ema_, frozen_copy, sigreg
+from .models import Decoder, Encoder, Predictor, ema_, frozen_copy, sigreg
 from .probes import mlp_probe, probe_suite, r2
+from .retain import RefMap
 
 ARMS = {  # arm: (context path, target path)
     "lewm": ("raw", "all"),
@@ -50,7 +51,10 @@ ARMS = {  # arm: (context path, target path)
     "context": ("proj", "none"),
     "both": ("proj", "open"),
     "block": ("mask", "open"),
+    "retain": ("raw", "none"),  # sg + reference-gated retention
+    "retain_open": ("raw", "open"),  # + the floor-gated open target path (noise removal)
 }
+RETAIN_ARMS = ("retain", "retain_open")
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,14 @@ class Cfg:
     # added later: part of the run id only when set, so earlier run ids stay valid
     head_start: int = 0  # steps in which the encoder gets only SIGReg while the predictor trains
     early_eval: tuple = ()  # extra probe evals at these steps (before the update), in early.csv
+    # reference-gated retention (arms retain, retain_open; docs/reference_gated_retention.md)
+    shadow_rec: float = 1.0  # reconstruction weight of the shadow encoder (0: SIGReg only)
+    ret_lam: float = 1.0  # weight of the retention loss on the live encoder
+    ret_every: int = 50  # steps between refreshes of the reference basis and weights
+    ret_tau: float = 0.995  # EMA of the reference statistics
+    ret_lag: float = 0.999  # lag of the shadow predictor's copy that defines "still learning"
+    ret_eps_g: float = 0.02  # relative improvement above which a direction counts as unsettled
+    ret_eps_f: float = 0.1  # excess of the live predictor over the floor that keeps retention
 
     @property
     def run_id(self) -> str:
@@ -111,7 +123,9 @@ class Cfg:
         return f"{self.arm}_s{self.seed}_{h}"
 
 
-_LATE_FIELDS = {"head_start": 0, "early_eval": ()}
+_LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
+                "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
+                "ret_eps_f": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False}
 
 
@@ -155,6 +169,16 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
              else torch.optim.AdamW(p_params, cfg.lr, weight_decay=cfg.wd))
     gate = FloorGate(D, dev, cfg.window, cfg.eps_g, cfg.eps_f, cfg.delta, cfg.min_dwell,
                      cfg.floor_keep, cfg.floor_margin, cfg.soft)
+    use_ret = cfg.arm in RETAIN_ARMS
+    if use_ret:  # shadow encoder (+ decoder), shadow predictor, retention head, reference map
+        shadow, Qs = Encoder(D, cfg.env.res).to(dev), Predictor(D, T).to(dev)
+        Qs_lag = frozen_copy(Qs)
+        dec = Decoder(D, cfg.env.res).to(dev) if cfg.shadow_rec > 0 else None
+        Rh = torch.nn.Linear(D, D).to(dev)
+        s_params = [*shadow.parameters(), *Qs.parameters(), *(dec.parameters() if dec else [])]
+        opt_s = torch.optim.AdamW(s_params, cfg.lr, weight_decay=cfg.wd)
+        opt_r = torch.optim.AdamW(Rh.parameters(), cfg.lr, weight_decay=cfg.wd)
+        ref = RefMap(D, dev, cfg.ret_tau, cfg.ret_every, cfg.ret_eps_g, cfg.ret_eps_f)
     acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
     early, early_at = [], set(cfg.early_eval)
     t0 = time.time()
@@ -193,6 +217,32 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         with torch.no_grad():
             gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach(), a) - zt_d))
         sig = cfg.lam * sigreg(torch.cat([zc.transpose(0, 1), zt[None]]), cfg.n_slices)
+        enc_aux = sig  # what shapes the encoder besides the prediction paths: SIGReg (+ retention)
+        if use_ret:
+            # shadow: SIGReg (+ reconstruction) only, so it keeps content; Qs gives the floor
+            zs = shadow(clip.x)  # (N, T, D)
+            zs_c, zs_t = zs[:, :-1].detach(), zs[:, -1].detach()
+            qp = Qs(zs_c, a)
+            with torch.no_grad():
+                r, r_lag = qp - zs_t, Qs_lag(zs_c, a) - zs_t
+            loss_s = ((qp - zs_t).pow(2).mean()
+                      + cfg.lam * sigreg(zs.transpose(0, 1), cfg.n_slices))
+            if dec is not None:
+                loss_s = loss_s + cfg.shadow_rec * (dec(zs) - clip.x).pow(2).mean()
+            opt_s.zero_grad(set_to_none=True)
+            loss_s.backward()
+            opt_s.step()
+            ema_(Qs_lag, Qs, cfg.ret_lag)
+            # retention: the live latent must keep the weighted part of the shadow latent readable
+            y = (zs.detach() - ref.mu) @ ref.W  # whitened shadow coordinates, every frame
+            e = Rh(torch.cat([zc, zt[:, None]], 1)) - y
+            L_ret = ((e @ ref.M) * e).sum(-1).mean() / D
+            enc_aux = sig + cfg.ret_lam * L_ret
+            gR = torch.autograd.grad(cfg.ret_lam * L_ret, list(Rh.parameters()), retain_graph=True)
+            with torch.no_grad():
+                ref.update(zs.detach().flatten(0, 1), r, r_lag, Rh(p.detach()) - y[:, -1])
+            acc["ret_loss"].append(L_ret.item())
+            acc["shadow_loss"].append(loss_s.item())
 
         # derivatives w.r.t. the latents (cheap), then encoder VJPs per path
         ins = p_params + ([zc] if ctx_m != "none" else [])
@@ -201,7 +251,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         if ctx_m == "mask":  # the encoder learns from the open directions only; P still from all
             L_enc = ((p - zt_d) @ gate.Q).pow(2).mul(gate.w_open()).mean()
             dL_dzc = torch.autograd.grad(L_enc, zc, retain_graph=True)[0]
-        ds_dzc, ds_dzt = torch.autograd.grad(sig, [zc, zt], retain_graph=True)
+        ds_dzc, ds_dzt = torch.autograd.grad(enc_aux, [zc, zt], retain_graph=True)
         Qb = gate.Q
         rt = (zt_d - p.detach()) @ Qb  # target residual in the gate basis
 
@@ -228,6 +278,10 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         for prm, gp in zip(p_params, gP, strict=True):
             prm.grad = gp
         opt_p.step()
+        if use_ret:
+            for prm, gr in zip(Rh.parameters(), gR, strict=True):
+                prm.grad = gr
+            opt_r.step()
         ema_(P_lag, P, cfg.tau_lag)
         if enc_ema is not None:
             ema_(enc_ema, enc, cfg.tau_ema)
@@ -276,6 +330,16 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                 on_step(step + 1, "eval")
             m, content = probe_suite(enc, P, env, gate.Q, cfg.probe_n, enc_tgt=enc_ema)
             st = gate.state()
+            if use_ret:  # what the shadow knows, and whether rho separates content without labels
+                m_sh, c_sh = probe_suite(shadow, Qs, env, ref.basis(), cfg.probe_n)
+                m.update({f"sh_{k}": v for k, v in m_sh.items()
+                          if k.startswith(("r2_", "pred_r2_"))})
+                c, rho = c_sh.numpy(), ref.rho.cpu().numpy()
+                noisy = c[:, 3] > 0.5
+                pred = (c[:, :3].max(1) > 0.5) & ~noisy
+                m["ref_rho_noise"] = float(rho[noisy].mean()) if noisy.any() else float("nan")
+                m["ref_rho_pred"] = float(rho[pred].mean()) if pred.any() else float("nan")
+                m.update(ref.summary())
             row = {"step": step + 1, "n_S": int(st["inS"].sum()),
                    "gap_mean": st["gap"].mean().item(), "excess_med": st["excess"].median().item(),
                    **m}
