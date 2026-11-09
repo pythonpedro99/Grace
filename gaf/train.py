@@ -335,10 +335,15 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                 m.update({f"sh_{k}": v for k, v in m_sh.items()
                           if k.startswith(("r2_", "pred_r2_"))})
                 c, rho = c_sh.numpy(), ref.rho.cpu().numpy()
-                noisy = c[:, 3] > 0.5
-                pred = (c[:, :3].max(1) > 0.5) & ~noisy
-                m["ref_rho_noise"] = float(rho[noisy].mean()) if noisy.any() else float("nan")
-                m["ref_rho_pred"] = float(rho[pred].mean()) if pred.any() else float("nan")
+                dom, top = c.argmax(1), c.max(1)  # direction -> the group it carries most
+                for gi, g in enumerate(GROUPS):  # mean rho and count of the directions of a group
+                    mg = (dom == gi) & (top > 0.15)
+                    m[f"ref_rho_{g}"] = float(rho[mg].mean()) if mg.any() else float("nan")
+                    m[f"ref_n_{g}"] = int(mg.sum())
+                noisy, signal = (dom == 3) & (top > 0.15), (dom != 3) & (top > 0.15)
+                m["ref_auc"] = (float((rho[signal][:, None] > rho[noisy][None]).mean()
+                                      + 0.5 * (rho[signal][:, None] == rho[noisy][None]).mean())
+                                if noisy.any() and signal.any() else float("nan"))
                 m.update(ref.summary())
             row = {"step": step + 1, "n_S": int(st["inS"].sum()),
                    "gap_mean": st["gap"].mean().item(), "excess_med": st["excess"].median().item(),

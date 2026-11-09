@@ -109,8 +109,17 @@ The live encoder minimises `L_pred (+ open path) + λ·SIGReg + λ_ret·L_ret`; 
 Six runs of 12 000 steps, no head start: `retain_open` on the default world (seeds 0 and 1) and with the white hard sprite
 (seeds 0 and 1); `retain_open` with a SIGReg-only shadow; `retain` alone. Compared with `sg` and with the best earlier fix,
 `both` + head start. Success criteria, fixed in advance: fast ≥ 0.9 (default world) and hard ≥ 0.7 (white world) in both
-seeds, noise ≤ 0.3, slow ≥ 0.9, and `ref_rho_pred − ref_rho_noise ≥ 0.5` by step 2000 (the reference separates content from
-noise without labels). Diagnostics logged: `sh_r2_*` (what the shadow represents), `ref_rho_*`, `ref_w`, `ref_unsettled`.
+seeds, noise ≤ 0.3, slow ≥ 0.9, and by step 2000 `ref_auc ≥ 0.9` with `ref_rho_fast`, `ref_rho_hard ≥ 0.1` (the reference
+separates content from noise, and sees the sprites, without labels). Diagnostics logged: `sh_r2_*` (what the shadow
+represents), `ref_rho_<group>` and `ref_n_<group>` (ρ and number of directions of each group), `ref_auc`, `ref_w`,
+`ref_unsettled`.
+
+**Pilot, before any retention training.** On three frozen SIGReg-only encoders, with a predictor trained on their latents,
+noise-dominated directions all have ρ = 0.000 and slow-dominated ones 0.12–0.32 (AUC of ρ separating content from noise
+0.88–0.96). The sprites, however, form no direction of their own (no fast-dominated direction, at most two hard-dominated
+ones, ρ ≈ 0.007), so in a SIGReg-only shadow the weights would free them once the shadow predictor settles. Whether the
+reconstruction shadow represents them sharply enough to change this is what stage 8 tests; if not, ρ per linear direction
+needs a softer or nonlinear version.
 
 ## 7. Open questions
 

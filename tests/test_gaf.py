@@ -359,4 +359,4 @@ def test_retention_arms_run_and_log_the_reference(arm, rec, tmp_path):
     f = run(cfg, tmp_path, verbose=False)["final"]
     for k in ("ret_loss", "shadow_loss", "ref_w", "ref_rho", "sh_r2_slow", "sh_r2_fast"):
         assert math.isfinite(f[k]), k
-    assert 0 <= f["ref_w"] <= 1 and "ref_rho_noise" in f and "ref_rho_pred" in f
+    assert 0 <= f["ref_w"] <= 1 and "ref_auc" in f and "ref_rho_noise" in f and "ref_n_hard" in f
