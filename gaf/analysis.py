@@ -390,6 +390,35 @@ def leak_panel(df, out, arms, **where):
     return curves(df, out, arms, cols=["leak_pos", "lreal_S", "lreal_open", "n_S"], **where)
 
 
+def drift(df, out, runs: dict, cols=("r2_fast", "r2_hard", "r2_noise", "r2_slow", "ref_unsettled"),
+          window=4000) -> pd.DataFrame:
+    """How much each run still moved over its last `window` steps.
+
+    d_<g>: net change of the metric over the window. swing_<g>: max minus min of an R^2 inside the
+    window, which catches oscillations that end where they started. `settled` is False if any R^2
+    changed by 0.05 or more, or swung by 0.1 or more. ref_unsettled (retention arms) is the number
+    of directions the shadow predictor was still improving on: its change is reported, not judged.
+    """
+    rows = {}
+    for lab, sel in runs.items():
+        c = curve(df, out, sel)
+        last = c.index.max()
+        before = c.index[c.index <= last - window]
+        first = before.max() if len(before) else c.index.min()
+        inside = c.loc[first:last]
+        r, ok = {}, True
+        for col in cols:
+            if col not in c:
+                continue
+            g = col.replace("r2_", "")
+            r[f"d_{g}"] = c[col].get(last, np.nan) - c[col].get(first, np.nan)
+            if col.startswith("r2_"):
+                r[f"swing_{g}"] = inside[col].max() - inside[col].min()
+                ok = ok and abs(r[f"d_{g}"]) < 0.05 and r[f"swing_{g}"] < 0.1
+        rows[lab] = {"steps": int(last), **r, "settled": bool(ok)}
+    return pd.DataFrame(rows).T
+
+
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]  # fixed order, one colour per line
 
 

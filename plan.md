@@ -23,7 +23,9 @@ does. The second half lists what can make the experiment fail or mislead, and wh
 3. **Slow and noise look identical.** Both are smooth colour patterns from one orthonormal basis.
    Only the dynamics separate them.
 4. **Capacity and premise.**
-   - The default is D = 32 with n_slow = 16: room for every group.
+   - The default is D = 32 with n_slow = 16. This is **not** spare room: the factor dimensions are
+     16 slow + 8 noise + 4 + 4 sprite = 32, so D is exactly full if noise is encoded too (corrected after
+     stage 8: in a SIGReg-only shadow the sprite's readout rises only as slow and noise readouts fall).
    - The premise holds through nonlinear slow copies: Gaussianized pairwise products of the slow
      factors bring a slow-only latent to SIGReg ≈ 7 at D = 32, against ≈ 1 for a Gaussian and ≈ 230
      for zero padding. `premise()` reports it.
@@ -123,7 +125,8 @@ Ordered by how likely they are to break the experiment or its interpretation.
    - **Risk:** early on everything is in S, and `g_ctx` and `g_tgt,S` are correlated through shared
      weights. Projection can then remove useful context learning, and `context`/`both` learn slowly.
    - **Watch:** `proj_ratio` and the slow R² curve early in training. **Knob:** `alpha`.
-8. **Capacity versus premise** (addressed: the default is the roomy regime, D = 32, n_slow = 16).
+8. **Capacity versus premise** (the default D = 32 is exactly the number of factor dimensions, so it is
+   tight once noise is encoded; the "roomy regime" wording below was wrong).
    - **Gain:** a fix does not have to trade slow content for sprites, and the verdict can ask for
      slow within 0.1 of `sg`.
    - **Cost:** the premise now relies on slow content filling the spare room with nonlinear copies.
@@ -199,6 +202,12 @@ One seed, 7 runs, all with early evals:
   predictable part readable (retention loss) until its own predictor has caught up, and directions that are settled
   and unpredictable are free (noise). Arms `retain` and `retain_open`. Six runs of 12k steps; success criteria are
   written in the notebook before the results.
+- **settledness (flagged by the user after stage 8):** the stage 8 runs stopped at 12k steps and several had not
+  settled: white seed 1 hard +0.16 and noise −0.13 over the last 4000 steps, red seed 1 noise +0.10 in the last
+  2000, the SIGReg-only shadow still moving, and the number of unsettled shadow directions still falling in all runs
+  (14→9, 19→14, 19→11, 18→10). Their numbers are provisional. `A.drift` reports the change over the last steps of any
+  run; stage 9 runs 20k steps with D=32 twins. `drift` also reports the swing inside the window (it catches oscillations
+  that end where they started). Do not call a result final unless `settled` is True.
 - Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
 Reading guide: the table at the end of notebook stage 7. If a head start keeps fast, the remedy is a

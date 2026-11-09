@@ -41,9 +41,12 @@ Slow and noise patterns share one orthonormal pixel basis. Both are equally easy
 an image, and only their dynamics differ.
 
 **Capacity and the premise.** The failure needs slow content that can fill SIGReg's budget on its
-own. The default latent, D = 32, is twice n_slow = 16, so there is room for every group: a fix does not
-have to trade slow content for sprites. Slow content can still fill the spare room with Gaussianized
-nonlinear copies of itself. `premise()` measures this: at D = 32, slow plus copies reaches SIGReg ≈ 7,
+own. The default latent, D = 32, is twice n_slow = 16, but the world has 16 slow + 8 noise + 4 fast +
+4 hard factor dimensions: 32 in total. **D = 32 is exactly full if noise is encoded too**, so the groups
+compete for room, and content that is cheap for SIGReg (slow and noise: linear and Gaussian by
+construction) wins it. A SIGReg-only encoder lets a sprite in only as slow and noise content recede (stage 8,
+SIGReg-only shadow); a reconstruction objective forces all groups in. Slow content can also fill spare room with
+Gaussianized nonlinear copies of itself. `premise()` measures this: at D = 32, slow plus copies reaches SIGReg ≈ 7,
 against ≈ 1 for a true Gaussian and ≈ 230 for slow content alone. The tight regime D = n_slow, where
 slow content alone is an exact isotropic Gaussian, is its own notebook stage (4b).
 

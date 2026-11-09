@@ -360,3 +360,13 @@ def test_retention_arms_run_and_log_the_reference(arm, rec, tmp_path):
     for k in ("ret_loss", "shadow_loss", "ref_w", "ref_rho", "sh_r2_slow", "sh_r2_fast"):
         assert math.isfinite(f[k]), k
     assert 0 <= f["ref_w"] <= 1 and "ref_auc" in f and "ref_rho_noise" in f and "ref_n_hard" in f
+
+
+def test_drift_flags_runs_that_have_not_settled(tmp_path):
+    from gaf.analysis import collect, drift
+    cfg = Cfg(arm="sg", **{**TINY, "steps": 20})
+    run(cfg, tmp_path, verbose=False)
+    d = drift(collect(tmp_path), tmp_path, {"sg": dict(arm="sg")}, window=10)
+    assert d.loc["sg", "steps"] == 20 and "d_fast" in d and "swing_noise" in d
+    assert d.loc["sg", "settled"] in (True, False)
+
