@@ -412,7 +412,7 @@ def drift(df, out, runs: dict, cols=("r2_fast", "r2_hard", "r2_noise", "r2_slow"
                 continue
             g = col.replace("r2_", "")
             r[f"d_{g}"] = c[col].get(last, np.nan) - c[col].get(first, np.nan)
-            if col.startswith("r2_"):
+            if col.startswith(("r2_", "sh_r2_")):
                 r[f"swing_{g}"] = inside[col].max() - inside[col].min()
                 ok = ok and abs(r[f"d_{g}"]) < 0.05 and r[f"swing_{g}"] < 0.1
         rows[lab] = {"steps": int(last), **r, "settled": bool(ok)}

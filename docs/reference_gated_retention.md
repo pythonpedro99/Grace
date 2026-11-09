@@ -4,7 +4,8 @@
 tested in notebook stage 8. The first stage 8 runs (12 000 steps, 2 seeds) kept slow, fast and hard content without any
 head start or labels, but several runs had **not settled** when they stopped (noise and hard still moved by 0.07–0.16 over
 the last 4000 steps, and the retention was still releasing), so their numbers are provisional. Stage 9 repeats the key
-runs for 20 000 steps and the notebook reports the change over the last steps (`A.drift`). Everything called a finding
+SIGReg-only shadow for 20 000 steps at D = 32 and D = 64, and the notebook reports the change over the last steps
+(`A.drift`). Everything called a finding
 comes from one synthetic world and 1–3 seeds.
 
 ## 1. The problem

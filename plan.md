@@ -206,7 +206,7 @@ One seed, 7 runs, all with early evals:
   settled: white seed 1 hard +0.16 and noise −0.13 over the last 4000 steps, red seed 1 noise +0.10 in the last
   2000, the SIGReg-only shadow still moving, and the number of unsettled shadow directions still falling in all runs
   (14→9, 19→14, 19→11, 18→10). Their numbers are provisional. `A.drift` reports the change over the last steps of any
-  run; stage 9 runs 20k steps with D=32 twins. `drift` also reports the swing inside the window (it catches oscillations
+  run; stage 9 reruns the SIGReg-only shadow for 20k steps at D=32 and D=64 (runs cannot be resumed, they start again). `drift` also reports the swing inside the window (it catches oscillations
   that end where they started). Do not call a result final unless `settled` is True.
 - Skipped for now: the lag ablation (`ema` with τ = 0.9, 0.99).
 
