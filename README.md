@@ -8,6 +8,10 @@ the predictor has stopped improving and sits near its achievable error floor.
 Spec: `docs/gain_attribution_one_pager.pdf` (section numbers below refer to it). Design decisions
 where the one-pager is silent, and the critical points of the experiment: [plan.md](plan.md).
 
+**The two variants for the benchmark** (architecture, losses, hyperparameters, status):
+[docs/benchmark_variants.md](docs/benchmark_variants.md): A, `target` + head start, and B, reference-gated retention
+with a reconstruction shadow (`retain_open`; details in [docs/reference_gated_retention.md](docs/reference_gated_retention.md)).
+
 ## The problem in one paragraph
 
 SIGReg checks only batch statistics. Slow features vary strongly between clips, so they satisfy
