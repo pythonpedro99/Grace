@@ -140,7 +140,9 @@ class GridEnv:
               "fast": F.one_hot(Fc, 4).float(),
               "hard": F.one_hot(hand, N_MAT).float(),
               "noise": torch.cat([xy(mob), tw * 2 - 1], -1),
-              "local": F.one_hot(local, N_MAT).float().flatten(2)}
+              "local": F.one_hot(local, N_MAT).float().flatten(2),
+              # the whole map, constant in a clip: not a group, for latent_determined_by()
+              "map": F.one_hot(mat, N_MAT).float().flatten(1)[:, None].expand(-1, T, -1)}
         a1 = F.one_hot(a, ACT_DIM).float()
         if not render:
             return Clip(None, a1, f_)

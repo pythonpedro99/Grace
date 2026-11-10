@@ -31,7 +31,8 @@ def test_grid_dynamics(random_map):
     torch.manual_seed(0)
     clip = env.sample(3000)
     assert clip.x.shape == (3000, c.T, 3, c.res, c.res) and clip.x.abs().max() <= 1
-    assert clip.a.shape == (3000, c.T - 1, 5) and set(clip.f) == {*GROUPS, "local"}
+    assert clip.a.shape == (3000, c.T - 1, 5) and set(clip.f) == {*GROUPS, "local", "map"}
+    assert clip.f["map"].shape == (3000, c.T, c.H * c.W * N_MAT)
     assert {g: clip.f[g].shape[-1] for g in GROUPS} == env.dims
     a, face = clip.a.argmax(-1), clip.f["fast"].argmax(-1)
     p, hand = _xy(clip.f["slow"], c), clip.f["hard"].argmax(-1)
@@ -106,3 +107,12 @@ def test_parts_r2(tmp_path):
 def test_capacity_runs():
     df = capacity(SMALL, Ds=(4, 8), steps=6, eval_every=3, n_eval=64, batch=16, desc=False)
     assert list(df.D.unique()) == [4, 8] and df.filter(like="pred_").notna().all().all()
+
+
+def test_latent_determined_by(tmp_path):
+    from gaf.analysis import latent_determined_by
+    cfg = Cfg(arm="sg", env=SMALL, D=8, steps=6, batch=16, floor_start=3, floor_every=3,
+              floor_steps=3, floor_pool=64, eval_every=6, probe_n=64, mlp_n=128, mlp_steps=3)
+    run(cfg, tmp_path, verbose=False)
+    t = latent_determined_by({"sg": cfg}, tmp_path, n=128, steps=5)
+    assert list(t.columns) == ["map", "inventory+position", "facing+hand", "mob+twinkle", "all"]

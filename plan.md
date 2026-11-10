@@ -226,6 +226,9 @@ the first real benchmark. Design decisions:
   0.95, against 0.25 in the clip world), so positions are slow content. Facing (cap 0.03) is fast. The hand, the material
   in front of the agent after its action (cap ≈ 0.2), is hard: it needs the action and the blocks around the agent.
 - **Random map per clip**, as in Craftax. The latent must then hold the blocks around the agent, which costs room.
+  First stage-4 result with it: every baseline's latent was a full-rank Gaussian, constant within a clip, holding none of the
+  labelled groups (slow ≈ 0 too). The map is slow content with more entropy than the HUD, so it takes the room; the group R²
+  cannot see it. `latent_determined_by()` (stage 4b) measures what the latent is made of. Not switched off: it is the Craftax setting.
   `capacity()` (stage 2b) measures the D the content needs; D = 32 is provisional until it has run.
 - **One seed per stage.** The last cell of the notebook adds seeds 1 and 2 (optional).
 - **Arms:** `detached` (availability, stage 2c), `lewm`, `sg`, `ema`, A (`target` + head start 3000 / 5000), the control

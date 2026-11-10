@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 
 from .env import GROUPS
 from .gate import floor_probe
-from .probes import ridge_r2
+from .probes import r2, ridge_r2
 from .models import Predictor
 from .train import Cfg, device, load_model, make_env, run
 
@@ -312,6 +312,49 @@ def parts_r2(cfgs: dict, out, n=8192) -> pd.DataFrame:
         clip = env.sample(2 * n)
         z = torch.cat([enc(clip.x[i:i + 2048, -1]) for i in range(0, 2 * n, 2048)])
         rows[lab] = {p: ridge_r2(z, clip.f[g][:, -1, s], n) for p, (g, s) in env.parts().items()}
+    return pd.DataFrame(rows).T.round(3)
+
+
+def latent_determined_by(cfgs: dict, out, n=8192, steps=600) -> pd.DataFrame:
+    """Which content does the latent of a finished run depend on? Share of the latent's variance
+    that a small MLP can predict from a set of factors (held-out R^2, z_t from the factors of the
+    target frame): 1 = the latent is a function of them, 0 = it carries nothing of them.
+
+    Needed because the random map of the grid world is the largest slow content but no group
+    labels it, and a linear probe from a 32-d latent cannot read 320 map cells back (the other
+    direction, factors -> latent, can show that the latent is *made of* the map). Sets: map,
+    inventory + position, facing + hand, mob + twinkle, and all of them together.
+    cfgs: {label: Cfg} of grid-world runs."""
+    rows = {}
+    for lab, cfg in cfgs.items():
+        torch.manual_seed(cfg.seed + 7)
+        enc, _, _ = load_model(cfg, out)
+        env = make_env(cfg.env, device())
+        clip = env.sample(2 * n)
+        with torch.no_grad():
+            z = torch.cat([enc(clip.x[i:i + 2048, -1]) for i in range(0, 2 * n, 2048)])
+        parts = env.parts()
+        grab = lambda names: torch.cat([clip.f[parts[k][0]][:, -1, parts[k][1]] for k in names], -1)  # noqa: E731
+        sets = {"map": clip.f["map"][:, -1],
+                "inventory+position": grab(("inventory", "position")),
+                "facing+hand": grab(("facing", "hand")),
+                "mob+twinkle": grab(("mob", "twinkle"))}
+        sets["all"] = torch.cat(list(sets.values()), -1)
+        row = {}
+        for name, x in sets.items():
+            net = torch.nn.Sequential(torch.nn.Linear(x.shape[1], 256), torch.nn.GELU(),
+                                      torch.nn.Linear(256, 256), torch.nn.GELU(),
+                                      torch.nn.Linear(256, z.shape[1])).to(z.device)
+            opt = torch.optim.Adam(net.parameters(), 1e-3)
+            for _ in range(steps):
+                i = torch.randint(0, n, (512,), device=z.device)
+                loss = (net(x[i]) - z[i]).pow(2).mean()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+            with torch.no_grad():
+                row[name] = r2(z[n:], net(x[n:]))
+        rows[lab] = row
     return pd.DataFrame(rows).T.round(3)
 
 
