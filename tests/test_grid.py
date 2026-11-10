@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from gaf.env import GROUPS
-from gaf.env_grid import DIRS, EMPTY, MOVES, N_MAT, STONE, GridCfg, GridEnv
+from gaf.env_grid import DIRS, EMPTY, MOVES, N_MAT, STONE, TC, GridCfg, GridEnv, component_masses
 from gaf.train import Cfg, capacity, run, run_gt
 
 SMALL = GridCfg(W=8, H=6, n_slow=8)  # 32 x 32 frame: fast enough for tiny runs
@@ -32,7 +32,7 @@ def test_grid_dynamics(random_map):
     torch.manual_seed(0)
     clip = env.sample(3000)
     assert clip.x.shape == (3000, c.T, 3, c.res, c.res) and clip.x.abs().max() <= 1
-    assert clip.a.shape == (3000, c.T - 1, 5) and set(clip.f) == {*GROUPS, "local", "map"}
+    assert clip.a.shape == (3000, c.T - 1, 5) and set(clip.f) == {*GROUPS, "local", "map", "hand_visible", "tile_class"}
     assert clip.f["map"].shape == (3000, c.T, c.H * c.W * N_MAT)
     assert {g: clip.f[g].shape[-1] for g in GROUPS} == env.dims
     a, face = clip.a.argmax(-1), clip.f["fast"].argmax(-1)
@@ -140,3 +140,92 @@ def test_frame_difference_reconstruction(tmp_path):
     s = json.loads((tmp_path / cfg.run_id / "summary.json").read_text())
     assert all(math.isfinite(s[f"sh_mlp_r2_{g}"]) for g in GROUPS)  # the shadow's nonlinear probe
     assert "shadow" in torch.load(tmp_path / cfg.run_id / "model.pt")
+
+
+MASS = GridCfg(W=12, H=8, n_slow=16, hand_tiles=4, compass_tiles=3)  # the frame of grid_mass_law.ipynb (48 x 48)
+
+
+def _tile(img, c, row, col):  # (..., 3, res, res) in [0, 1] -> the colour of tile (row, col) at its top-left pixel
+    return img[..., :, row * c.tile, col * c.tile]
+
+
+def test_hand_and_compass_tiles_show_the_hand_and_the_facing():
+    env = GridEnv(MASS, "cpu")
+    torch.manual_seed(2)
+    clip = env.sample(64)
+    img = (clip.x + 1) / 2
+    hand, face = clip.f["hard"].argmax(-1), clip.f["fast"].argmax(-1)
+    c = MASS
+    for j in range(c.n_slow, c.n_slow + c.hand_tiles):
+        row, col = c.H + j // c.W, j % c.W
+        assert torch.allclose(_tile(img, c, row, col), env.mat_col[hand], atol=1e-5)
+        assert (clip.f["tile_class"][:, :, row * c.W + col] == TC["hand:floor"] + hand).all()
+    for j in range(c.n_slow + c.hand_tiles, c.n_slow + c.hand_tiles + c.compass_tiles):
+        row, col = c.H + j // c.W, j % c.W
+        assert torch.allclose(_tile(img, c, row, col), env.compass_col[face], atol=1e-5)
+        assert (clip.f["tile_class"][:, :, row * c.W + col] == TC["compass:up"] + face).all()
+    with pytest.raises(AssertionError):
+        GridEnv(GridCfg(n_slow=16, hand_tiles=4, compass_tiles=1), "cpu")  # 21 tiles > the 20 of a 10 x 10 frame
+
+
+def test_hand_presence_hides_the_hand_tiles_per_clip():
+    env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.3), "cpu")
+    torch.manual_seed(3)
+    clip = env.sample(2000)
+    vis = clip.f["hand_visible"][:, 0, 0] > 0.5
+    assert 0.2 < vis.float().mean() < 0.4
+    assert (clip.f["hand_visible"] == clip.f["hand_visible"][:, :1]).all()  # per clip, not per frame
+    row, col = 8 + 16 // 12, 16 % 12
+    img = (clip.x + 1) / 2
+    assert torch.allclose(_tile(img, env.cfg, row, col)[~vis], env.hand_mean.expand_as(_tile(img, env.cfg, row, col)[~vis]), atol=1e-5)
+    assert (clip.f["tile_class"][~vis][:, :, row * 12 + col] == TC["hud:empty"]).all()
+
+
+def test_tile_classes_follow_what_is_drawn():
+    env = GridEnv(GridCfg(), "cpu")
+    torch.manual_seed(4)
+    clip = env.sample(500)
+    c, cls = env.cfg, clip.f["tile_class"]
+    pos = _xy(clip.f["slow"], c)
+    face = clip.f["fast"].argmax(-1)
+    agent_idx = pos[..., 1] * c.W + pos[..., 0]
+    assert (cls.gather(-1, agent_idx[..., None])[..., 0] == TC["agent:up"] + face).all()
+    assert cls.max() < len(TC) and cls.min() >= 0
+    assert ((cls >= TC["inventory:0"]) & (cls <= TC["inventory:9"])).sum() == 500 * c.T * c.n_slow
+
+
+def test_component_masses_grow_with_the_tiles():
+    m1 = component_masses(GridCfg(W=12, H=8, hand_tiles=1), n=256)
+    m4 = component_masses(GridCfg(W=12, H=8, hand_tiles=4, compass_tiles=2), n=256)
+    assert set(m4) >= {"hand", "compass", "facing marker", "agent (with marker)", "mob", "twinkle", "inventory (one slot)"}
+    assert all(0 < v < 1 for v in m4.values())
+    assert 3 < m4["hand"] / m1["hand"] < 5  # four tiles carry about four times the mass of one
+
+
+@pytest.mark.parametrize("kw", [dict(arm="ae"), dict(arm="ae", rec_class_power=0.5), dict(arm="retain_open", rec_class_power=1.0)])
+def test_autoencoder_and_class_balanced_reconstruction_run(kw, tmp_path):
+    cfg = Cfg(env=SMALL, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128,
+              mlp_n=256, mlp_steps=5, ret_every=4, lam=0.01, **kw)
+    s = run(cfg, tmp_path, verbose=False)
+    assert all(math.isfinite(s["final"][f"r2_{g}"]) for g in GROUPS)
+    assert {"pm_hand", "pm_facing", "pm_mob", "pm_rank"} <= set(s)
+    if kw["arm"] == "ae":
+        assert math.isfinite(s["final"]["ae_rec_mse"])
+    else:
+        assert "sh_pm_hand" in s
+
+
+def test_class_weights_lift_the_rare_classes():
+    from gaf.train import class_weights
+    torch.manual_seed(0)
+    w, share = class_weights(GridEnv(GridCfg(), "cpu"), 1.0, n=256)
+    assert w[TC["agent:left"]] > w[TC["map:floor"]]  # an agent tile is rare, the floor is everywhere
+    assert w.max() <= 30 + 1e-4 and abs(share.sum().item() - 1) < 1e-4
+
+
+def test_visible_hand_probe():
+    from gaf.probes import parts_probe
+    env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.5), "cpu")
+    enc = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(3 * 48 * 48, 8))
+    out = parts_probe(enc, env, n_train=256, n_test=128, steps=5)
+    assert "pm_hand_visible" in out and "pm_rank" in out

@@ -40,7 +40,7 @@ from .env_grid import GridCfg, GridEnv
 from .gate import FloorGate, floor_probe
 from .grads import SplitAdamW, vjp
 from .models import Decoder, Encoder, Predictor, ema_, frozen_copy, sigreg
-from .probes import mlp_probe, probe_suite, r2
+from .probes import mlp_probe, parts_probe, probe_suite, r2
 from .retain import RefMap
 
 ARMS = {  # arm: (context path, target path)
@@ -54,8 +54,10 @@ ARMS = {  # arm: (context path, target path)
     "block": ("mask", "open"),
     "retain": ("raw", "none"),  # sg + reference-gated retention
     "retain_open": ("raw", "open"),  # + the floor-gated open target path (noise removal)
+    "ae": ("none", "none"),  # an autoencoder: reconstruction + SIGReg, no prediction loss (B's shadow encoder on its own)
 }
 RETAIN_ARMS = ("retain", "retain_open")
+AE_ARMS = ("ae",)
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,10 @@ class Cfg:
     # SIGReg on the latent differences z_t - z_{t-1} (every consecutive pair of frames), weight lam_diff: static content has a zero
     # difference and cannot satisfy it, changing content can. With lam = 0 the encoder sees only this term (a diagnostic).
     lam_diff: float = 0.0
+    # class-balanced reconstruction (arm ae and B's shadow; grid world only): each tile's squared error is weighted by its
+    # ground-truth tile class's share of the pixel variance to the power -rec_class_power (tempered, capped at 30x, mean 1).
+    # 0: off, plain pixel MSE.
+    rec_class_power: float = 0.0
 
     @property
     def run_id(self) -> str:
@@ -134,8 +140,9 @@ class Cfg:
 
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
-                "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0}
-_LATE_ENV_FIELDS = {"swap_colors": False}
+                "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
+                "rec_class_power": 0.0}
+_LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0}
 
 
 def make_env(env_cfg, dev):
@@ -150,6 +157,38 @@ def device() -> str:
 def _is_floor_step(c: Cfg, step: int) -> bool:
     return step == c.floor_start or (step > c.floor_start
                                      and (step - c.floor_start) % c.floor_every == 0)
+
+
+@torch.no_grad()
+def class_weights(env, power: float, n: int = 2048, cap: float = 30.0):
+    """Per tile class (f["tile_class"]): its share of the pixel variance to the power -`power`, capped, with a tile-count
+    weighted mean of 1. Classes that do not occur keep weight 1. Returns (weights, shares)."""
+    clip = env.sample(n)
+    c = env.cfg
+    t = clip.x.view(n, c.T, 3, c.W, c.tile, c.W, c.tile).permute(0, 1, 3, 5, 2, 4, 6).reshape(n, c.T, c.W * c.W, -1)
+    dev2 = ((t - t.mean((0, 1), keepdim=True)) ** 2).sum(-1).flatten()  # per tile, against the mean tile at its position
+    cls = clip.f["tile_class"].flatten()
+    k = int(cls.max().item()) + 1
+    mass = torch.zeros(k, device=dev2.device).index_add_(0, cls, dev2)
+    count = torch.bincount(cls, minlength=k).float()
+    share = mass / mass.sum()
+    present = count > 0
+    w = torch.ones(k, device=dev2.device)
+    w[present] = (share[present] / share[present].mean()).clamp_min(1e-12) ** (-power)
+    w = w.clamp(1 / cap, cap)
+    w = w / ((w * count).sum() / count.sum())
+    return w, share
+
+
+def rec_error(x_hat, x, cls=None, w=None, tile=None):
+    """Mean squared reconstruction error per pixel and channel; with class weights w (per tile class), each tile's error is
+    weighted by w[its class]. x, x_hat: (..., 3, res, res); cls: (..., tiles) with tiles = (res / tile)^2."""
+    e = (x_hat - x) ** 2
+    if w is None:
+        return e.mean()
+    side = x.shape[-1] // tile
+    per_tile = e.view(*e.shape[:-3], 3, side, tile, side, tile).sum((-5, -3, -1)).flatten(-2)  # (..., tiles)
+    return (per_tile * w[cls]).sum() / (cls.numel() * 3 * tile * tile)
 
 
 def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
@@ -194,6 +233,14 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         opt_s = torch.optim.AdamW(s_params, cfg.lr, weight_decay=cfg.wd)
         opt_r = torch.optim.AdamW(Rh.parameters(), cfg.lr, weight_decay=cfg.wd)
         ref = RefMap(D, dev, cfg.ret_tau, cfg.ret_every, cfg.ret_eps_g, cfg.ret_eps_f)
+    use_ae = cfg.arm in AE_ARMS
+    if use_ae:  # the autoencoder's decoder (its encoder is `enc`)
+        ae_dec = Decoder(D, cfg.env.res).to(dev)
+        opt_d = torch.optim.AdamW(ae_dec.parameters(), cfg.lr, weight_decay=cfg.wd)
+    cls_w = None
+    if cfg.rec_class_power > 0:
+        assert isinstance(cfg.env, GridCfg), "class-balanced reconstruction needs the grid world's tile classes"
+        cls_w, _ = class_weights(env, cfg.rec_class_power)
     acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
     early, early_at = [], set(cfg.early_eval)
     t0 = time.time()
@@ -236,7 +283,13 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         if cfg.lam_diff > 0:
             z_all = torch.cat([zc, zt[:, None]], 1)  # (N, T, D): every frame, context and target
             sig = sig + cfg.lam_diff * sigreg((z_all[:, 1:] - z_all[:, :-1]).transpose(0, 1), cfg.n_slices)
-        enc_aux = sig  # what shapes the encoder besides the prediction paths: SIGReg (+ retention)
+        enc_aux = sig  # what shapes the encoder besides the prediction paths: SIGReg (+ retention, + reconstruction)
+        if use_ae:  # reconstruction of every frame from its latent; the encoder gets it through z_c and z_t
+            rec = rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, clip.f.get("tile_class"), cls_w, cfg.env.tile
+                            if cls_w is not None else None)
+            enc_aux = enc_aux + cfg.shadow_rec * rec
+            gD = torch.autograd.grad(cfg.shadow_rec * rec, list(ae_dec.parameters()), retain_graph=True)
+            acc["ae_rec_mse"].append(rec.item())
         if use_ret:
             # shadow: SIGReg (+ reconstruction) only, so it keeps content; Qs gives the floor
             zs = shadow(clip.x)  # (N, T, D)
@@ -251,7 +304,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                     rec = (dec(torch.cat([zs[:, :-1], zs[:, 1:]], -1))
                            - (clip.x[:, 1:] - clip.x[:, :-1])).pow(2).mean()
                 else:
-                    rec = (dec(zs) - clip.x).pow(2).mean()
+                    rec = rec_error(dec(zs), clip.x, clip.f.get("tile_class"), cls_w,
+                                    cfg.env.tile if cls_w is not None else None)
                 loss_s = loss_s + cfg.shadow_rec * rec
                 acc["shadow_rec_mse"].append(rec.item())  # the reconstruction term of shadow_loss
             opt_s.zero_grad(set_to_none=True)
@@ -303,6 +357,10 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         for prm, gp in zip(p_params, gP, strict=True):
             prm.grad = gp
         opt_p.step()
+        if use_ae:
+            for prm, gd in zip(ae_dec.parameters(), gD, strict=True):
+                prm.grad = gd
+            opt_d.step()
         if use_ret:
             for prm, gr in zip(Rh.parameters(), gR, strict=True):
                 prm.grad = gr
@@ -396,6 +454,11 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         on_step(cfg.steps, "final probes")
     summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": time.time() - t0,
                "final": rows[-1], **mlp_probe(enc, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps)}
+    if hasattr(env, "parts"):  # standardised MLP per named part, and the effective rank (grid world)
+        kw = dict(n_train=cfg.mlp_n, n_test=cfg.probe_n, steps=2 * cfg.mlp_steps)
+        summary.update(parts_probe(enc, env, **kw))
+        if use_ret:
+            summary.update(parts_probe(shadow, env, prefix="sh_", **kw))
     if use_ret:  # what the shadow holds nonlinearly: the ridge readout of the eval rows can miss it
         summary.update({f"sh_{k}": v for k, v in
                         mlp_probe(shadow, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps).items()})

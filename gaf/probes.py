@@ -97,3 +97,40 @@ def mlp_probe(enc, env, n_train=20000, n_test=8192, steps=1000, hidden=256):
     with torch.no_grad():
         yh = net(z[n_train:])
     return {f"mlp_r2_{g}": r2(y[n_train:, s], yh[:, s]) for g, s in env.group_cols().items()}
+
+
+def parts_probe(enc, env, n_train=16000, n_test=8000, steps=2000, hidden=256, prefix=""):
+    """Standardised MLP probe of every named part of the env (`env.parts()`) from z of the target frame, held out, plus the
+    effective rank of z. Keys `<prefix>pm_<part>`, `<prefix>pm_rank`; with hidden hand tiles (`hand_visible`) also
+    `<prefix>pm_hand_visible`, the hand read on the clips where it is shown."""
+    was = enc.training
+    enc.eval()
+    with torch.no_grad():
+        clip = env.sample(n_train + n_test)
+        z, y = encode(enc, clip.x[:, -1]), env.factors(clip)
+    enc.train(was)
+    out = {f"{prefix}pm_rank": eff_rank(z)}
+    mu, sd = z[:n_train].mean(0), z[:n_train].std(0).clamp_min(1e-6)
+    z = (z - mu) / sd
+    net = nn.Sequential(nn.Linear(z.shape[1], hidden), nn.GELU(), nn.Linear(hidden, hidden),
+                        nn.GELU(), nn.Linear(hidden, y.shape[1])).to(z.device)
+    opt = torch.optim.Adam(net.parameters(), 1e-3)
+    for _ in range(steps):
+        i = torch.randint(0, n_train, (512,), device=z.device)
+        loss = (net(z[i]) - y[i]).pow(2).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    with torch.no_grad():
+        yh = net(z[n_train:])
+    cols, yt = env.group_cols(), y[n_train:]
+    for part, (g, s) in env.parts().items():
+        sl = slice(cols[g].start + s.start, cols[g].start + s.stop)
+        out[f"{prefix}pm_{part}"] = r2(yt[:, sl], yh[:, sl])
+    vis = clip.f.get("hand_visible")
+    if vis is not None and (vis[n_train:, -1, 0] < 0.5).any():
+        m = vis[n_train:, -1, 0] > 0.5
+        g, s = env.parts()["hand"]
+        sl = slice(cols[g].start + s.start, cols[g].start + s.stop)
+        out[f"{prefix}pm_hand_visible"] = r2(yt[m][:, sl], yh[m][:, sl])
+    return out

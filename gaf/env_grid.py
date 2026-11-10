@@ -17,7 +17,16 @@
 The map holds wood (brown), stone (grey) and water (blue) on a share `density` of the cells; they
 block movement, and the border counts as stone. random_map: a new map per clip (as Craftax), else
 one map fixed by the seed. Actions are one-hot over (noop, up, down, left, right); the predictor sees
-all T-1 of them. The frame is W x W tiles: H map rows, then hud_rows HUD rows.
+all T-1 of them. The frame is W x W tiles: H map rows, then W - H HUD rows.
+
+Knobs for the mass experiments (grid_mass_law.ipynb), all off by default:
+    hand_tiles     the hand is shown in this many HUD tiles (its pixel mass grows with it)
+    compass_tiles  the facing is also shown in this many HUD tiles (a fixed-location copy of the marker)
+    hand_p         per clip, the hand tiles are visible with this probability (frequency against size); hidden tiles show
+                   the average hand colour, so being hidden adds no variance of its own (as an absent block in Craftax
+                   shows ordinary terrain, not a blank)
+`f["tile_class"]` holds the ground-truth class of every tile (TILE_CLASSES) for the class-balanced loss,
+and `component_masses()` measures each component's share of the pixel variance.
 """
 from dataclasses import dataclass
 
@@ -35,6 +44,14 @@ MAT_COL = torch.tensor([[0.12, 0.12, 0.12], [0.55, 0.33, 0.12], [0.55, 0.55, 0.5
                         [0.15, 0.35, 0.85]])
 AGENT, FACE = torch.tensor([1.0, 1.0, 1.0]), torch.tensor([1.0, 0.85, 0.0])
 MOB, TWINKLE = torch.tensor([0.2, 0.9, 0.2]), torch.tensor([0.9, 0.2, 0.8])
+HAND_SHARE = torch.tensor([0.38, 0.20, 0.32, 0.10])  # how often the hand shows empty, wood, stone, water (density 0.35)
+COMPASS_COL = torch.tensor([[0.95, 0.30, 0.30], [0.30, 0.95, 0.30], [0.30, 0.30, 0.95], [0.95, 0.95, 0.30]])
+# ground-truth tile classes (f["tile_class"]): what a tile shows
+TILE_CLASSES = (["map:" + m for m in ("floor", "wood", "stone", "water")] + ["twinkle", "mob"]
+                + ["agent:" + d for d in ("up", "down", "left", "right")]
+                + [f"inventory:{v}" for v in range(10)] + ["hand:" + m for m in ("floor", "wood", "stone", "water")]
+                + ["compass:" + d for d in ("up", "down", "left", "right")] + ["hud:empty"])
+TC = {name: i for i, name in enumerate(TILE_CLASSES)}
 
 
 @dataclass(frozen=True)
@@ -50,6 +67,9 @@ class GridCfg:
     random_map: bool = True  # a new map per clip (False: one map, fixed by the seed)
     n_twinkle: int = 4  # noise tiles (always floor)
     seed: int = 0  # fixes the HUD colours, the twinkle cells and (random_map=False) the map
+    hand_tiles: int = 1  # HUD tiles that show the hand
+    compass_tiles: int = 0  # HUD tiles that show the facing (0: only the marker on the agent)
+    hand_p: float = 1.0  # probability per clip that the hand tiles are visible
 
     @property
     def res(self) -> int:
@@ -65,8 +85,11 @@ class GridEnv:
     def __init__(self, cfg: GridCfg = GridCfg(), device="cpu"):
         c = cfg
         assert c.H < c.W and c.res % 8 == 0 and c.T >= 2
-        assert c.n_slow + 1 <= (c.W - c.H) * c.W, "HUD slots and the hand must fit the HUD rows"
+        assert c.n_slow + c.hand_tiles + c.compass_tiles <= (c.W - c.H) * c.W, \
+            "the inventory, hand and compass tiles must fit the HUD rows"
+        assert c.levels <= 10, "tile classes cover inventory levels 0..9"
         self.cfg, self.dev = c, device
+        self.hide = set()  # components left out of the frame (component_masses): hand, compass, facing, agent, mob, twinkle, inventory
         gen = torch.Generator().manual_seed(c.seed)
         cells = torch.randperm(c.H * c.W, generator=gen)[:c.n_twinkle]
         self.tw_y, self.tw_x = (cells // c.W).to(device), (cells % c.W).to(device)
@@ -74,6 +97,8 @@ class GridEnv:
         self.hud_col = (hue / hue.max(1, keepdim=True).values).to(device)
         self.fixed_map = None if c.random_map else self._maps(1, gen).to(device)
         self.mat_col, self.moves = MAT_COL.to(device), MOVES.to(device)
+        self.compass_col = COMPASS_COL.to(device)
+        self.hand_mean = (HAND_SHARE[:, None] * MAT_COL).sum(0).to(device)  # what a hidden hand tile shows
         # within-tile masks of the facing half: up, down, left, right
         r = torch.arange(c.res, device=device) % c.tile < c.tile // 2
         yy, xx = r[:, None].expand(c.res, c.res), r[None, :].expand(c.res, c.res)
@@ -132,6 +157,9 @@ class GridEnv:
                              for d in range(4)], 1).view(n, T, 8)
         mob = self._rand_free(free, T)  # (n, T, 2)
         tw = torch.rand(n, T, c.n_twinkle, device=dev)
+        # the hand tiles' visibility per clip (drawn only when hand_p < 1: default clips are unchanged)
+        vis = (torch.rand(n, device=dev) < c.hand_p if c.hand_p < 1
+               else torch.ones(n, dtype=torch.bool, device=dev))
 
         def xy(v):  # integer xy -> [-1, 1]
             return torch.stack([v[..., 0] / (c.W - 1), v[..., 1] / (c.H - 1)], -1) * 2 - 1
@@ -142,36 +170,61 @@ class GridEnv:
               "noise": torch.cat([xy(mob), tw * 2 - 1], -1),
               "local": F.one_hot(local, N_MAT).float().flatten(2),
               # the whole map, constant in a clip: not a group, for latent_determined_by()
-              "map": F.one_hot(mat, N_MAT).float().flatten(1)[:, None].expand(-1, T, -1)}
+              "map": F.one_hot(mat, N_MAT).float().flatten(1)[:, None].expand(-1, T, -1),
+              "hand_visible": vis.float()[:, None, None].expand(-1, T, 1)}
         a1 = F.one_hot(a, ACT_DIM).float()
         if not render:
             return Clip(None, a1, f_)
-        return Clip(self._render(mat, P, Fc, hand, hud, mob, tw), a1, f_)
+        x, cls = self._render(mat, P, Fc, hand, hud, mob, tw, vis)
+        f_["tile_class"] = cls
+        return Clip(x, a1, f_)
 
-    def _render(self, mat, P, Fc, hand, hud, mob, tw):
-        c, dev = self.cfg, self.dev
+    def _render(self, mat, P, Fc, hand, hud, mob, tw, vis):
+        """The frames (n, T, 3, res, res) in [-1, 1] and the class of every tile (n, T, W * W)."""
+        c, dev, hide = self.cfg, self.dev, self.hide
         n, T = P.shape[:2]
         rows = c.W  # frame is W x W tiles
         g = torch.zeros(n, T, rows, c.W, 3, device=dev)
+        cls = torch.full((n, T, rows, c.W), TC["hud:empty"], dtype=torch.long, device=dev)
         g[:, :, :c.H] = self.mat_col[mat][:, None]
-        g[:, :, self.tw_y, self.tw_x] = (self.mat_col[EMPTY] + tw[..., None] * TWINKLE.to(dev)
-                                         ).clamp(max=1)
-        k = torch.arange(c.n_slow + 1, device=dev)
+        cls[:, :, :c.H] = mat[:, None]  # map:floor .. map:water are 0..3
+        if "twinkle" not in hide:
+            g[:, :, self.tw_y, self.tw_x] = (self.mat_col[EMPTY] + tw[..., None] * TWINKLE.to(dev)).clamp(max=1)
+            cls[:, :, self.tw_y, self.tw_x] = TC["twinkle"]
+        n_hud = c.n_slow + c.hand_tiles + c.compass_tiles
+        k = torch.arange(n_hud, device=dev)
         hy, hx = c.H + k // c.W, k % c.W
-        g[:, :, hy[:-1], hx[:-1]] = hud[..., None] / (c.levels - 1) * self.hud_col
-        g[:, :, hy[-1], hx[-1]] = self.mat_col[hand]
+        s0, s1 = c.n_slow, c.n_slow + c.hand_tiles
+        if "inventory" not in hide:
+            g[:, :, hy[:s0], hx[:s0]] = hud[..., None] / (c.levels - 1) * self.hud_col
+            cls[:, :, hy[:s0], hx[:s0]] = TC["inventory:0"] + hud
+        if c.hand_tiles and "hand" not in hide:
+            shown = vis[:, None, None]  # (n, 1, 1)
+            col = self.mat_col[hand][:, :, None]  # (n, T, 1, 3)
+            g[:, :, hy[s0:s1], hx[s0:s1]] = torch.where(shown[..., None], col, self.hand_mean.expand_as(col))
+            cls[:, :, hy[s0:s1], hx[s0:s1]] = torch.where(shown, TC["hand:floor"] + hand[..., None],
+                                                          torch.full_like(hand[..., None], TC["hud:empty"]))
+        if c.compass_tiles and "compass" not in hide:
+            g[:, :, hy[s1:], hx[s1:]] = self.compass_col[Fc][:, :, None]
+            cls[:, :, hy[s1:], hx[s1:]] = TC["compass:up"] + Fc[..., None]
         flat = g.view(n, T, rows * c.W, 3)
+        cflat = cls.view(n, T, rows * c.W)
         ni, ti = torch.arange(n, device=dev)[:, None], torch.arange(T, device=dev)[None]
-        flat[ni, ti, mob[..., 1] * c.W + mob[..., 0]] = MOB.to(dev)
+        if "mob" not in hide:
+            flat[ni, ti, mob[..., 1] * c.W + mob[..., 0]] = MOB.to(dev)
+            cflat[ni, ti, mob[..., 1] * c.W + mob[..., 0]] = TC["mob"]
         agent = torch.zeros(n, T, rows * c.W, device=dev, dtype=torch.bool)
-        agent[ni, ti, P[..., 1] * c.W + P[..., 0]] = True
+        if "agent" not in hide:
+            agent[ni, ti, P[..., 1] * c.W + P[..., 0]] = True
+            cflat[ni, ti, P[..., 1] * c.W + P[..., 0]] = TC["agent:up"] + Fc
         up = c.tile
         x = g.repeat_interleave(up, 2).repeat_interleave(up, 3)  # (n, T, res, res, 3)
         am = agent.view(n, T, rows, c.W).repeat_interleave(up, 2).repeat_interleave(up, 3)
         half = self.face_mask[Fc]  # (n, T, res, res)
-        x = torch.where((am & half)[..., None], FACE.to(dev),
+        face = AGENT if "facing" in hide else FACE
+        x = torch.where((am & half)[..., None], face.to(dev),
                         torch.where(am[..., None], AGENT.to(dev), x))
-        return (x * 2 - 1).permute(0, 1, 4, 2, 3).contiguous()  # (n, T, 3, res, res) in [-1, 1]
+        return (x * 2 - 1).permute(0, 1, 4, 2, 3).contiguous(), cflat
 
     def parts(self) -> dict:
         """Named parts of the groups: part -> (group, columns within the group)."""
@@ -190,3 +243,27 @@ class GridEnv:
             out[g] = slice(i, i + self.dims[g])
             i += self.dims[g]
         return out
+
+
+@torch.no_grad()
+def component_masses(cfg: GridCfg, n: int = 2048, seed: int = 0) -> dict:
+    """Share of the pixel variance (per-pixel variance over clips, mean over pixels) that each component explains: the
+    variance over clips of the component's contribution (the frames minus the same frames with the component left out),
+    over the variance of the frames. A component that looks the same in every clip contributes nothing, however bright."""
+    def draw(hide=()):
+        env = GridEnv(cfg, "cpu")
+        env.hide = set(hide)
+        torch.manual_seed(seed)
+        return env.sample(n).x
+
+    x = draw()
+    var = x.var(0).mean().item()
+    out = {}
+    for name, hide in (("hand", ("hand",)), ("compass", ("compass",)), ("facing marker", ("facing",)),
+                       ("agent (with marker)", ("agent",)), ("mob", ("mob",)), ("twinkle", ("twinkle",)),
+                       ("inventory (all slots)", ("inventory",))):
+        if name == "compass" and not cfg.compass_tiles:
+            continue
+        out[name] = (x - draw(hide)).var(0).mean().item() / var
+    out["inventory (one slot)"] = out["inventory (all slots)"] / cfg.n_slow
+    return out

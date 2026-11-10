@@ -160,7 +160,7 @@ def collect(out) -> pd.DataFrame:
         s = json.loads(p.read_text())
         env = {f"env.{k}": v for k, v in s["cfg"].pop("env").items()}
         rows.append({"run_id": s["run_id"], **s["cfg"], **env, "seconds": s["seconds"],
-                     **s["final"], **{k: v for k, v in s.items() if k.startswith(("mlp_", "sh_mlp_"))}})
+                     **s["final"], **{k: v for k, v in s.items() if k.startswith(("mlp_", "sh_mlp_", "pm_", "sh_pm_"))}})
     return pd.DataFrame(rows)
 
 
