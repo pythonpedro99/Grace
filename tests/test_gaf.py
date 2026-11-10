@@ -370,3 +370,14 @@ def test_drift_flags_runs_that_have_not_settled(tmp_path):
     assert d.loc["sg", "steps"] == 20 and "d_fast" in d and "swing_noise" in d
     assert d.loc["sg", "settled"] in (True, False)
 
+
+
+def test_lam_diff_adds_sigreg_on_the_latent_differences(tmp_path):
+    base = Cfg(arm="detached", env=SMALL, D=8)
+    assert Cfg(arm="detached", env=SMALL, D=8, lam_diff=0.0).run_id == base.run_id  # old run ids stay valid
+    assert Cfg(arm="detached", env=SMALL, D=8, lam_diff=0.1).run_id != base.run_id
+    kw = dict(env=SMALL, D=8, steps=12, batch=16, floor_start=5, floor_every=5, floor_steps=5, floor_pool=128, eval_every=6,
+              diag_every=3, min_dwell=2, window=5, probe_n=128, mlp_n=256, mlp_steps=5)
+    for lam, lam_diff in ((0.1, 0.1), (0.0, 0.1)):  # frames and differences; differences only (lam 0: no division by lam in the log)
+        f = run(Cfg(arm="detached", lam=lam, lam_diff=lam_diff, **kw), tmp_path, verbose=False)["final"]
+        assert all(math.isfinite(f[f"r2_{g}"]) for g in GROUPS) and math.isfinite(f["sigreg"])

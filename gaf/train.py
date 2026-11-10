@@ -115,6 +115,9 @@ class Cfg:
     # agent, mob) carries much more of the loss. Differences have ~1/3.6 of the frame MSE in the
     # grid world: raise shadow_rec to compensate. Off: plain frame reconstruction.
     rec_diff: bool = False
+    # SIGReg on the latent differences z_t - z_{t-1} (every consecutive pair of frames), weight lam_diff: static content has a zero
+    # difference and cannot satisfy it, changing content can. With lam = 0 the encoder sees only this term (a diagnostic).
+    lam_diff: float = 0.0
 
     @property
     def run_id(self) -> str:
@@ -131,7 +134,7 @@ class Cfg:
 
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
-                "ret_eps_f": 0.1, "rec_diff": False}
+                "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0}
 _LATE_ENV_FIELDS = {"swap_colors": False}
 
 
@@ -228,7 +231,11 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         L = (p - zt_d).pow(2).mean()  # (1/D) sum_j L_j: LeWM's MSE scale
         with torch.no_grad():
             gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach(), a) - zt_d))
-        sig = cfg.lam * sigreg(torch.cat([zc.transpose(0, 1), zt[None]]), cfg.n_slices)
+        sig_raw = sigreg(torch.cat([zc.transpose(0, 1), zt[None]]), cfg.n_slices)
+        sig = cfg.lam * sig_raw
+        if cfg.lam_diff > 0:
+            z_all = torch.cat([zc, zt[:, None]], 1)  # (N, T, D): every frame, context and target
+            sig = sig + cfg.lam_diff * sigreg((z_all[:, 1:] - z_all[:, :-1]).transpose(0, 1), cfg.n_slices)
         enc_aux = sig  # what shapes the encoder besides the prediction paths: SIGReg (+ retention)
         if use_ret:
             # shadow: SIGReg (+ reconstruction) only, so it keeps content; Qs gives the floor
@@ -334,7 +341,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                     acc[f"lk_{part}_open"].append((lk * (1 - gate.w_S())).sum().item())
 
         acc["loss"].append(L.item())
-        acc["sigreg"].append(sig.item() / cfg.lam)
+        acc["sigreg"].append(sig_raw.item())  # the SIGReg of the frames, whatever the weights
         if diag:  # exact check: l_real = L(theta', z_t(theta)) - L(theta', z_t(theta'))
             with torch.no_grad():
                 p2 = P(enc(xc), a)
