@@ -60,7 +60,7 @@ Knobs: `n_slow`, `slow_rho`, `n_noise`, `v_act`, `h_act` (action strength), `har
 ## The grid world (`gaf/env_grid.py`, `grid_benchmark.ipynb`)
 
 The stepping stone to Craftax: the same four groups, but discrete, relational and Craftax-shaped. A 10×8 tile map with
-wood, stone and water (one fixed map in the notebook; `random_map=True` gives a new map per clip), two HUD rows below it, 40×40 pixels. Actions are one-hot over noop, up, down,
+wood, stone and water (a new map per clip), two HUD rows below it, 40×40 pixels. Actions are one-hot over noop, up, down,
 left, right.
 
 | group | content | R² without the action |

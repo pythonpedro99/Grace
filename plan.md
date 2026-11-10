@@ -225,10 +225,8 @@ the first real benchmark. Design decisions:
 - **Facing and hand instead of positions.** One-cell moves leave a position ≈ 95% predictable without the action (cap
   0.95, against 0.25 in the clip world), so positions are slow content. Facing (cap 0.03) is fast. The hand, the material
   in front of the agent after its action (cap ≈ 0.2), is hard: it needs the action and the blocks around the agent.
-- **Fixed map in the notebook, random map as the stress run.** With a new map per clip (the first design) the baselines
-  collapsed onto the map: SIGReg at its floor, `rank_z` 31, `wb_ratio` ≈ 0, no labelled content decodable, even slow
-  (the map has more entropy than the HUD and nothing labels it). Stage 2c on that env (no facing in the detached latent)
-  is confounded by it; redo it on the fixed map before dropping variant A. `capacity()` (stage 2b) measures the D the content needs.
+- **Random map per clip**, as in Craftax. The latent must then hold the blocks around the agent, which costs room.
+  `capacity()` (stage 2b) measures the D the content needs; D = 32 is provisional until it has run.
 - **One seed per stage.** The last cell of the notebook adds seeds 1 and 2 (optional).
 - **Arms:** `detached` (availability, stage 2c), `lewm`, `sg`, `ema`, A (`target` + head start 3000 / 5000), the control
   `sg` + head start, and B (`retain_open`). The ablations of B are skipped for now.
