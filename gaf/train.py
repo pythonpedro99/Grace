@@ -389,6 +389,9 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         on_step(cfg.steps, "final probes")
     summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": time.time() - t0,
                "final": rows[-1], **mlp_probe(enc, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps)}
+    if use_ret:  # what the shadow holds nonlinearly: the ridge readout of the eval rows can miss it
+        summary.update({f"sh_{k}": v for k, v in
+                        mlp_probe(shadow, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps).items()})
     pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
     if early:
         pd.DataFrame(early).to_csv(odir / "early.csv", index=False)
@@ -397,7 +400,9 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
              floor=np.stack([f.numpy() for _, f in floors]) if floors else np.zeros((0, D)),
              **{k: torch.stack(v).float().numpy() for k, v in dirs.items()})
     torch.save({"enc": enc.state_dict(), "P": P.state_dict(),
-                "enc_ema": enc_ema.state_dict() if enc_ema is not None else None},
+                "enc_ema": enc_ema.state_dict() if enc_ema is not None else None,
+                **({"shadow": shadow.state_dict(), "dec": dec.state_dict() if dec else None}
+                   if use_ret else {})},
                odir / "model.pt")
     (odir / "summary.json").write_text(json.dumps(summary))
     if on_step:

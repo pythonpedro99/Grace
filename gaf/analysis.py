@@ -160,7 +160,7 @@ def collect(out) -> pd.DataFrame:
         s = json.loads(p.read_text())
         env = {f"env.{k}": v for k, v in s["cfg"].pop("env").items()}
         rows.append({"run_id": s["run_id"], **s["cfg"], **env, "seconds": s["seconds"],
-                     **s["final"], **{k: v for k, v in s.items() if k.startswith("mlp_")}})
+                     **s["final"], **{k: v for k, v in s.items() if k.startswith(("mlp_", "sh_mlp_"))}})
     return pd.DataFrame(rows)
 
 
@@ -507,8 +507,8 @@ def snapshot(df, out, runs: dict, steps=(0, 50, 100, 200, 500, 1000, 3000),
     rows = {}
     for lab, sel in runs.items():
         c = curve(df, out, sel)
-        rows[lab] = {f"{col.replace('r2_', '')}@{s}": c[col].get(s, np.nan)
-                     for col in cols for s in steps}
+        rows[lab] = {f"{col.replace('r2_', '')}@{s}": (c[col].get(s, np.nan) if col in c else np.nan)
+                     for col in cols for s in steps}  # a metric the run never logged: NaN
     return pd.DataFrame(rows).T
 
 

@@ -1,4 +1,5 @@
 """CPU checks of the grid world: dynamics, rendering, caps without actions, runs of every core arm."""
+import json
 import math
 
 import pytest
@@ -136,3 +137,6 @@ def test_frame_difference_reconstruction(tmp_path):
     f = run(cfg, tmp_path, verbose=False)["final"]
     assert math.isfinite(f["shadow_rec_mse"]) and f["shadow_rec_mse"] > 0
     assert all(math.isfinite(f[f"sh_r2_{g}"]) for g in GROUPS)
+    s = json.loads((tmp_path / cfg.run_id / "summary.json").read_text())
+    assert all(math.isfinite(s[f"sh_mlp_r2_{g}"]) for g in GROUPS)  # the shadow's nonlinear probe
+    assert "shadow" in torch.load(tmp_path / cfg.run_id / "model.pt")
