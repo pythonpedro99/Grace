@@ -132,6 +132,7 @@ class Cfg:
     # grid world: at every eval, also the standardised MLP probe per named part (live encoder, and the shadow of retention arms),
     # trained on this many clips (0: off); logged as ev_pm_<part>, ev_sh_pm_<part>. metrics.csv is then rewritten at every eval.
     eval_parts: int = 0
+    eval_parts_steps: int = 400  # training steps of that probe (the final probe uses 2 * mlp_steps on mlp_n clips: stronger)
 
     @property
     def run_id(self) -> str:
@@ -149,7 +150,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0}
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
 
@@ -506,7 +507,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                                 if noisy.any() and signal.any() else float("nan"))
                 m.update(ref.summary())
             if cfg.eval_parts and hasattr(env, "parts"):
-                kw = dict(n_train=cfg.eval_parts, n_test=2048, steps=400)
+                kw = dict(n_train=cfg.eval_parts, n_test=2048, steps=cfg.eval_parts_steps)
                 m.update(parts_probe(enc, env, prefix="ev_", **kw))
                 if use_ret:
                     m.update(parts_probe(shadow, env, prefix="ev_sh_", **kw))

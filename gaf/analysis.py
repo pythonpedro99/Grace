@@ -160,12 +160,14 @@ def progress(out, cfgs) -> pd.DataFrame:
 
 
 PART_ORDER = ("hand", "position", "inventory", "facing", "mob", "twinkle")
+FLOOR = -0.5  # live_probes draws R² below this at the bottom edge instead of off the chart
 RUN_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
 
 
 def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done: bool = True, max_minutes: float | None = None):
     """Per-part MLP probe readouts against the training step, redrawn every `every` seconds. runs: name -> Cfg (with eval_parts > 0).
-    One panel per part: solid = the live encoder, dashed = the shadow (retention arms); one colour per run. Stops when every run
+    One panel per part: solid = the live encoder, dashed = the shadow (retention arms); one colour per run; values below -0.5 sit on
+    the bottom edge (a probe can be far below zero early on), a marker per eval. Stops when every run
     has finished (or after max_minutes). Interrupting the cell stops only the plot, not the runs."""
     from IPython.display import clear_output, display
 
@@ -184,9 +186,9 @@ def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done
             for ax, part in zip(axes.flat, parts):
                 for key, ls, lab in ((f"ev_pm_{part}", "-", name), (f"ev_sh_pm_{part}", "--", f"{name} (shadow)")):
                     if key in h:
-                        ax.plot(h["step"], h[key], color=col, ls=ls, label=lab)
+                        ax.plot(h["step"], h[key].clip(lower=FLOOR), color=col, ls=ls, label=lab, marker="o", ms=3)
         for ax, part in zip(axes.flat, parts):
-            ax.set(title=part, ylim=(-0.2, 1.05))
+            ax.set(title=part, ylim=(FLOOR - 0.05, 1.05))
             ax.axhline(0.5, color=MUTED, lw=0.8, ls=":")
         axes.flat[0].legend(loc="lower right", fontsize=7)
         fig.suptitle("MLP probe R² of each part from z_t (solid: live encoder, dashed: shadow)  ·  " + "  ".join(
