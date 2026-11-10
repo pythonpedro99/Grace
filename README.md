@@ -79,7 +79,7 @@ satisfy SIGReg: `premise()` at D = 32 gives 4.0 for slow plus copies, against 1.
 `capacity()` measures which latent size D the content needs, and `A.parts_r2()` reports R² per part (inventory and
 position inside slow, mob and tiles inside noise). D = 32 in the notebook is provisional until its stage 2b has run.
 Knobs: `W`, `H`, `tile`, `n_slow`, `levels`, `hud_p`, `density`, `random_map`, `n_twinkle`, and for the mass experiments
-`hand_tiles` (the hand shown in k HUD tiles), `compass_tiles` (the facing also shown in fixed HUD tiles) and `hand_p` (the hand tiles
+`hand_tiles` (the hand shown in k HUD tiles), `hand_contrast` (its colour contrast, for masses below one tile), `compass_tiles` (the facing also shown in fixed HUD tiles) and `hand_p` (the hand tiles
 visible in a share of the clips; hidden ones show the average hand colour). `component_masses()` gives each component's share of the
 pixel variance, and `f["tile_class"]` the ground-truth class of every tile.
 

@@ -194,6 +194,18 @@ def test_tile_classes_follow_what_is_drawn():
     assert ((cls >= TC["inventory:0"]) & (cls <= TC["inventory:9"])).sum() == 500 * c.T * c.n_slow
 
 
+def test_hand_contrast_scales_the_mass_with_its_square():
+    base = GridCfg(W=12, H=8, hand_tiles=2)
+    m1 = component_masses(base, n=512)["hand"]
+    m5 = component_masses(GridCfg(W=12, H=8, hand_tiles=2, hand_contrast=0.5), n=512)["hand"]
+    assert 0.2 < m5 / m1 < 0.3
+    env = GridEnv(GridCfg(W=12, H=8, hand_contrast=0.0), "cpu")  # no contrast: every clip shows the average colour
+    torch.manual_seed(1)
+    img = (env.sample(32).x + 1) / 2
+    c = env.cfg
+    assert torch.allclose(_tile(img, c, c.H + c.n_slow // c.W, c.n_slow % c.W), env.hand_mean.expand(32, c.T, 3), atol=1e-5)
+
+
 def test_component_masses_grow_with_the_tiles():
     m1 = component_masses(GridCfg(W=12, H=8, hand_tiles=1), n=256)
     m4 = component_masses(GridCfg(W=12, H=8, hand_tiles=4, compass_tiles=2), n=256)

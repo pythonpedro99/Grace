@@ -22,6 +22,8 @@ all T-1 of them. The frame is W x W tiles: H map rows, then W - H HUD rows.
 Knobs for the mass experiments (grid_mass_law.ipynb), all off by default:
     hand_tiles     the hand is shown in this many HUD tiles (its pixel mass grows with it)
     compass_tiles  the facing is also shown in this many HUD tiles (a fixed-location copy of the marker)
+    hand_contrast  the hand tiles' colour contrast against the average hand colour (1: the material colours; 0.5: a quarter of the
+                   mass), for masses below one tile
     hand_p         per clip, the hand tiles are visible with this probability (frequency against size); hidden tiles show
                    the average hand colour, so being hidden adds no variance of its own (as an absent block in Craftax
                    shows ordinary terrain, not a blank)
@@ -70,6 +72,7 @@ class GridCfg:
     hand_tiles: int = 1  # HUD tiles that show the hand
     compass_tiles: int = 0  # HUD tiles that show the facing (0: only the marker on the agent)
     hand_p: float = 1.0  # probability per clip that the hand tiles are visible
+    hand_contrast: float = 1.0  # contrast of the hand tiles against the average hand colour (mass scales with its square)
 
     @property
     def res(self) -> int:
@@ -201,6 +204,7 @@ class GridEnv:
         if c.hand_tiles and "hand" not in hide:
             shown = vis[:, None, None]  # (n, 1, 1)
             col = self.mat_col[hand][:, :, None]  # (n, T, 1, 3)
+            col = self.hand_mean + c.hand_contrast * (col - self.hand_mean)
             g[:, :, hy[s0:s1], hx[s0:s1]] = torch.where(shown[..., None], col, self.hand_mean.expand_as(col))
             cls[:, :, hy[s0:s1], hx[s0:s1]] = torch.where(shown, TC["hand:floor"] + hand[..., None],
                                                           torch.full_like(hand[..., None], TC["hud:empty"]))
