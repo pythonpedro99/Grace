@@ -456,6 +456,11 @@ def capacity(env_cfg, Ds=(16, 24, 32, 48, 64), steps=4000, batch=256, lam=0.1, l
     any training of that size can reach: the real encoder on rendered frames, *supervised* with the
     ground truth, plus SIGReg (weight lam) so the latent is shaped as in the real runs.
 
+    The targets are standardized per column and the supervised errors are summed over columns, so
+    the supervision outweighs SIGReg and SIGReg only shapes the latent. (A mean over columns lets
+    SIGReg push out content it finds expensive, such as one-hot factors, at every D: that measures
+    the SIGReg trade-off, not the capacity.) R^2 is computed in the original units.
+
     Per D: z = enc(x) for every frame; a linear head reads the current factors of `groups` from z
     (readout, what z holds) and the predictor P(z_c, a) with a linear head predicts the target
     frame's factors (prediction, what z supports). Held-out R^2 per group, every eval_every steps.
@@ -475,20 +480,21 @@ def capacity(env_cfg, Ds=(16, 24, 32, 48, 64), steps=4000, batch=256, lam=0.1, l
             return torch.cat([f[:, s] for s in sl], -1)
 
         d_y = sum(s.stop - s.start for s in sl)
+        with torch.no_grad():
+            ev = env.sample(n_eval)
+            y_ev, y_now = y_of(ev, -1), y_of(ev, -2)
+            mu, sd = y_ev.mean(0), y_ev.std(0).clamp_min(1e-6)  # standardization of the targets
         enc, P = Encoder(D, env_cfg.res).to(dev), Predictor(D, env_cfg.T, env.act_dim).to(dev)
         read, pred = torch.nn.Linear(D, d_y).to(dev), torch.nn.Linear(D, d_y).to(dev)
         params = [*enc.parameters(), *P.parameters(), *read.parameters(), *pred.parameters()]
         opt = torch.optim.AdamW(params, lr, weight_decay=0.01)
-        with torch.no_grad():
-            ev = env.sample(n_eval)
-            y_ev, y_now = y_of(ev, -1), y_of(ev, -2)
         T = env_cfg.T
         for step in tqdm(range(1, steps + 1), desc=f"capacity D={D}", unit="step", disable=not desc):
             clip = env.sample(batch)
             z = enc(clip.x)  # (n, T, D)
-            y_all = torch.stack([y_of(clip, t) for t in range(T)], 1)
-            loss = ((read(z) - y_all).pow(2).mean()
-                    + (pred(P(z[:, :-1], clip.a)) - y_all[:, -1]).pow(2).mean()
+            y_all = (torch.stack([y_of(clip, t) for t in range(T)], 1) - mu) / sd
+            loss = ((read(z) - y_all).pow(2).sum(-1).mean()
+                    + (pred(P(z[:, :-1], clip.a)) - y_all[:, -1]).pow(2).sum(-1).mean()
                     + lam * sigreg(z.transpose(0, 1)))
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -496,7 +502,7 @@ def capacity(env_cfg, Ds=(16, 24, 32, 48, 64), steps=4000, batch=256, lam=0.1, l
             if step % eval_every == 0 or step == steps:
                 with torch.no_grad():
                     ze = torch.cat([enc(ev.x[i:i + 1024]) for i in range(0, n_eval, 1024)])
-                    yr, yp = read(ze[:, -2]), pred(P(ze[:, :-1], ev.a))
+                    yr, yp = read(ze[:, -2]) * sd + mu, pred(P(ze[:, :-1], ev.a)) * sd + mu
                     row = {"D": D, "step": step, "sigreg": sigreg(ze.transpose(0, 1), 1024).item()}
                     i = 0
                     for g, s in zip(groups, sl, strict=True):
