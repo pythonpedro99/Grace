@@ -214,7 +214,9 @@ def test_component_masses_grow_with_the_tiles():
     assert 3 < m4["hand"] / m1["hand"] < 5  # four tiles carry about four times the mass of one
 
 
-@pytest.mark.parametrize("kw", [dict(arm="ae"), dict(arm="ae", rec_class_power=0.5), dict(arm="retain_open", rec_class_power=1.0)])
+@pytest.mark.parametrize("kw", [dict(arm="ae"), dict(arm="ae", rec_class_power=0.5), dict(arm="retain_open", rec_class_power=1.0),
+                                dict(arm="ae", rec_class_power=1.0, rec_clusters=8, rec_pos_types=3),
+                                dict(arm="retain_open", rec_class_power=1.0, rec_clusters=8, rec_pos_types=3)])
 def test_autoencoder_and_class_balanced_reconstruction_run(kw, tmp_path):
     cfg = Cfg(env=SMALL, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128,
               mlp_n=256, mlp_steps=5, ret_every=4, lam=0.01, **kw)
@@ -233,6 +235,25 @@ def test_class_weights_lift_the_rare_classes():
     w, share = class_weights(GridEnv(GridCfg(), "cpu"), 1.0, n=256)
     assert w[TC["agent:left"]] > w[TC["map:floor"]]  # an agent tile is rare, the floor is everywhere
     assert w.max() <= 30 + 1e-4 and abs(share.sum().item() - 1) < 1e-4
+
+
+def test_cluster_classes_find_the_hand_without_labels():
+    """Label-free classes: the hand is a tile that looks like a map tile, so appearance alone cannot isolate it; the position
+    type (by change rate) does, and the hand then gets a far larger weight than the map terrain."""
+    from gaf.train import assign_tiles, class_weights, cluster_classes
+    torch.manual_seed(0)
+    env = GridEnv(GridCfg(W=12, H=8, hand_tiles=1), "cpu")
+    cl, w, share = cluster_classes(env, 16, 1.0, n=256, n_fit=10000, k_pos=6)
+    clip = env.sample(128)
+    cls, gt = assign_tiles(clip.x, cl, env.cfg), clip.f["tile_class"]
+    assert cls.shape == gt.shape and cls.max() < 16 * 6
+    hand, terrain = torch.isin(gt, torch.tensor([TC["hand:floor"], TC["hand:wood"], TC["hand:stone"], TC["hand:water"]])), gt < 4
+    assert w[cls[hand]].mean() > 10 * w[cls[terrain]].mean()
+    _, w1, _ = cluster_classes(env, 16, 1.0, n=256, n_fit=10000, k_pos=1)  # appearance only: the hand sits in the terrain clusters
+    cls1 = assign_tiles(clip.x, (cl[0], torch.zeros_like(cl[1]), 16), env.cfg)
+    assert w1[cls1[hand]].mean() < 3 * w1[cls1[terrain]].mean()
+    wg, _ = class_weights(env, 1.0, n=256)
+    assert abs(share.sum().item() - 1) < 1e-4 and wg.max() <= 30 + 1e-4
 
 
 def test_visible_hand_probe():

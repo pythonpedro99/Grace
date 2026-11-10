@@ -124,6 +124,11 @@ class Cfg:
     # ground-truth tile class's share of the pixel variance to the power -rec_class_power (tempered, capped at 30x, mean 1).
     # 0: off, plain pixel MSE.
     rec_class_power: float = 0.0
+    # label-free version: instead of the ground-truth tile classes, k-means clusters (this many) of the tile pixels, fitted once on a
+    # sample of frames, and position types (rec_pos_types, by change rate) define the classes (needs rec_class_power > 0).
+    # 0: ground-truth classes.
+    rec_clusters: int = 0
+    rec_pos_types: int = 6  # position types of the cluster classes (1: appearance only)
 
     @property
     def run_id(self) -> str:
@@ -141,7 +146,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0}
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0}
 
@@ -160,16 +165,14 @@ def _is_floor_step(c: Cfg, step: int) -> bool:
                                      and (step - c.floor_start) % c.floor_every == 0)
 
 
-@torch.no_grad()
-def class_weights(env, power: float, n: int = 2048, cap: float = 30.0):
-    """Per tile class (f["tile_class"]): its share of the pixel variance to the power -`power`, capped, with a tile-count
-    weighted mean of 1. Classes that do not occur keep weight 1. Returns (weights, shares)."""
-    clip = env.sample(n)
-    c = env.cfg
-    t = clip.x.view(n, c.T, 3, c.W, c.tile, c.W, c.tile).permute(0, 1, 3, 5, 2, 4, 6).reshape(n, c.T, c.W * c.W, -1)
-    dev2 = ((t - t.mean((0, 1), keepdim=True)) ** 2).sum(-1).flatten()  # per tile, against the mean tile at its position
-    cls = clip.f["tile_class"].flatten()
-    k = int(cls.max().item()) + 1
+def _tiles(x, c):
+    """(n, T, 3, res, res) -> (n, T, tiles, 3*tile*tile): every tile as a row, in row-major tile order."""
+    n = x.shape[0]
+    return x.view(n, c.T, 3, c.W, c.tile, c.W, c.tile).permute(0, 1, 3, 5, 2, 4, 6).reshape(n, c.T, c.W * c.W, -1)
+
+
+def _weights_from(cls, dev2, power, cap, k):
+    """Weights per class from a tile -> class map `cls` and each tile's variance contribution `dev2` (flat, same length)."""
     mass = torch.zeros(k, device=dev2.device).index_add_(0, cls, dev2)
     count = torch.bincount(cls, minlength=k).float()
     share = mass / mass.sum()
@@ -179,6 +182,69 @@ def class_weights(env, power: float, n: int = 2048, cap: float = 30.0):
     w = w.clamp(1 / cap, cap)
     w = w / ((w * count).sum() / count.sum())
     return w, share
+
+
+@torch.no_grad()
+def class_weights(env, power: float, n: int = 2048, cap: float = 30.0):
+    """Per tile class (f["tile_class"]): its share of the pixel variance to the power -`power`, capped, with a tile-count
+    weighted mean of 1. Classes that do not occur keep weight 1. Returns (weights, shares)."""
+    clip = env.sample(n)
+    t = _tiles(clip.x, env.cfg)
+    dev2 = ((t - t.mean((0, 1), keepdim=True)) ** 2).sum(-1).flatten()  # per tile, against the mean tile at its position
+    cls = clip.f["tile_class"].flatten()
+    return _weights_from(cls, dev2, power, cap, int(cls.max().item()) + 1)
+
+
+@torch.no_grad()
+def kmeans(x, k: int, iters: int = 25, seed: int = 0):
+    """Lloyd's k-means with k-means++ seeding on rows of x (n, d). Returns the centroids (k, d)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    n = x.shape[0]
+    C = x[torch.randint(n, (1,), generator=g).item()][None]
+    for _ in range(k - 1):  # next centre drawn proportional to the squared distance to the nearest one
+        d2 = torch.cdist(x, C).min(1).values ** 2
+        C = torch.cat([C, x[torch.multinomial((d2 + 1e-12).cpu(), 1, generator=g).item()][None]])
+    for _ in range(iters):
+        a = torch.cdist(x, C).argmin(1)
+        S = torch.zeros_like(C).index_add_(0, a, x)
+        cnt = torch.bincount(a, minlength=k).float()[:, None]
+        C = torch.where(cnt > 0, S / cnt.clamp_min(1), C)
+    return C
+
+
+@torch.no_grad()
+def cluster_classes(env, k: int, power: float, n: int = 1024, cap: float = 30.0, n_fit: int = 60000, seed: int = 0,
+                    k_pos: int = 6):
+    """The label-free version of class_weights. A tile's class is a pair, both fitted on a sample of frames without labels:
+    its appearance (one of k k-means clusters of the raw tile pixels) and its position type (one of k_pos k-means clusters of
+    the tile positions, by how often the position changes between frames and its pixel spread). Pixels alone cannot find
+    content defined by where it is (a hand tile looks like a map tile); the change rate does (hand 47%, map 3%).
+    k_pos = 1: appearance only. Returns ((centroids, position type per tile position, k), weights, shares)."""
+    clip = env.sample(n)
+    t = _tiles(clip.x, env.cfg)
+    flat = t.reshape(-1, t.shape[-1])
+    sub = flat[torch.randperm(flat.shape[0], device=flat.device)[:n_fit]]
+    C = kmeans(sub, k, seed=seed)
+    ptype = torch.zeros(t.shape[2], dtype=torch.long, device=t.device)
+    if k_pos > 1:
+        change = (t[:, 1:] - t[:, :-1]).pow(2).sum(-1).gt(1e-6).float().mean((0, 1))
+        feat = torch.stack([change, t.var((0, 1)).sum(-1).sqrt()], 1)
+        feat = (feat - feat.mean(0)) / feat.std(0).clamp_min(1e-6)
+        ptype = torch.cdist(feat, kmeans(feat, k_pos, seed=seed)).argmin(1)
+    cl = (C, ptype, k)
+    cls = assign_tiles(clip.x, cl, env.cfg)
+    dev2 = ((t - t.mean((0, 1), keepdim=True)) ** 2).sum(-1).flatten()
+    w, share = _weights_from(cls.flatten(), dev2, power, cap, k * k_pos)
+    return cl, w, share
+
+
+@torch.no_grad()
+def assign_tiles(x, cl, c):
+    """Class of every tile of x (n, T, 3, res, res): (n, T, tiles); cl as returned by cluster_classes."""
+    C, ptype, k = cl
+    t = _tiles(x, c)
+    a = torch.cdist(t.reshape(-1, t.shape[-1]), C).argmin(1).view(t.shape[:-1])
+    return a + k * ptype
 
 
 def rec_error(x_hat, x, cls=None, w=None, tile=None):
@@ -238,10 +304,17 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     if use_ae:  # the autoencoder's decoder (its encoder is `enc`)
         ae_dec = Decoder(D, cfg.env.res).to(dev)
         opt_d = torch.optim.AdamW(ae_dec.parameters(), cfg.lr, weight_decay=cfg.wd)
-    cls_w = None
+    cls_w, centroids = None, None
     if cfg.rec_class_power > 0:
-        assert isinstance(cfg.env, GridCfg), "class-balanced reconstruction needs the grid world's tile classes"
-        cls_w, _ = class_weights(env, cfg.rec_class_power)
+        assert isinstance(cfg.env, GridCfg), "class-balanced reconstruction needs the grid world's frames"
+        if cfg.rec_clusters > 0:  # label-free: clusters of the tile pixels stand in for the tile classes
+            centroids, cls_w, _ = cluster_classes(env, cfg.rec_clusters, cfg.rec_class_power, seed=cfg.seed,
+                                                  k_pos=cfg.rec_pos_types)
+        else:
+            cls_w, _ = class_weights(env, cfg.rec_class_power)
+
+    def tile_cls(clip):  # the class of every tile of the batch, for rec_error
+        return assign_tiles(clip.x, centroids, cfg.env) if centroids is not None else clip.f.get("tile_class")
     acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
     early, early_at = [], set(cfg.early_eval)
     t0 = time.time()
@@ -286,7 +359,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             sig = sig + cfg.lam_diff * sigreg((z_all[:, 1:] - z_all[:, :-1]).transpose(0, 1), cfg.n_slices)
         enc_aux = sig  # what shapes the encoder besides the prediction paths: SIGReg (+ retention, + reconstruction)
         if use_ae:  # reconstruction of every frame from its latent; the encoder gets it through z_c and z_t
-            rec = rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, clip.f.get("tile_class"), cls_w, cfg.env.tile
+            rec = rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, tile_cls(clip), cls_w, cfg.env.tile
                             if cls_w is not None else None)
             enc_aux = enc_aux + cfg.shadow_rec * rec
             gD = torch.autograd.grad(cfg.shadow_rec * rec, list(ae_dec.parameters()), retain_graph=True)
@@ -305,7 +378,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                     rec = (dec(torch.cat([zs[:, :-1], zs[:, 1:]], -1))
                            - (clip.x[:, 1:] - clip.x[:, :-1])).pow(2).mean()
                 else:
-                    rec = rec_error(dec(zs), clip.x, clip.f.get("tile_class"), cls_w,
+                    rec = rec_error(dec(zs), clip.x, tile_cls(clip), cls_w,
                                     cfg.env.tile if cls_w is not None else None)
                 loss_s = loss_s + cfg.shadow_rec * rec
                 acc["shadow_rec_mse"].append(rec.item())  # the reconstruction term of shadow_loss
