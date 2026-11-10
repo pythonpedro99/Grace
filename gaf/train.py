@@ -234,7 +234,9 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             loss_s = ((qp - zs_t).pow(2).mean()
                       + cfg.lam * sigreg(zs.transpose(0, 1), cfg.n_slices))
             if dec is not None:
-                loss_s = loss_s + cfg.shadow_rec * (dec(zs) - clip.x).pow(2).mean()
+                rec = (dec(zs) - clip.x).pow(2).mean()
+                loss_s = loss_s + cfg.shadow_rec * rec
+                acc["shadow_rec_mse"].append(rec.item())  # the reconstruction term of shadow_loss
             opt_s.zero_grad(set_to_none=True)
             loss_s.backward()
             opt_s.step()

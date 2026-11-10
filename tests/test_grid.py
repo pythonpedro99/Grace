@@ -116,3 +116,11 @@ def test_latent_determined_by(tmp_path):
     run(cfg, tmp_path, verbose=False)
     t = latent_determined_by({"sg": cfg}, tmp_path, n=128, steps=5)
     assert list(t.columns) == ["map", "inventory+position", "facing+hand", "mob+twinkle", "all"]
+
+
+def test_shadow_reconstruction_mse_is_logged(tmp_path):
+    cfg = Cfg(arm="retain_open", env=SMALL, D=8, steps=12, batch=16, floor_start=5, floor_every=5,
+              floor_steps=5, floor_pool=128, eval_every=6, diag_every=3, min_dwell=2, window=5,
+              probe_n=128, mlp_n=256, mlp_steps=5, ret_every=4)
+    f = run(cfg, tmp_path, verbose=False)["final"]
+    assert math.isfinite(f["shadow_rec_mse"]) and f["shadow_rec_mse"] > 0
