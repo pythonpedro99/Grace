@@ -124,3 +124,15 @@ def test_shadow_reconstruction_mse_is_logged(tmp_path):
               probe_n=128, mlp_n=256, mlp_steps=5, ret_every=4)
     f = run(cfg, tmp_path, verbose=False)["final"]
     assert math.isfinite(f["shadow_rec_mse"]) and f["shadow_rec_mse"] > 0
+
+
+def test_frame_difference_reconstruction(tmp_path):
+    base = Cfg(arm="retain_open", env=SMALL, D=8)
+    assert Cfg(arm="retain_open", env=SMALL, D=8, rec_diff=False).run_id == base.run_id  # old ids stay valid
+    assert Cfg(arm="retain_open", env=SMALL, D=8, rec_diff=True).run_id != base.run_id
+    cfg = Cfg(arm="retain_open", env=SMALL, D=8, steps=12, batch=16, floor_start=5, floor_every=5,
+              floor_steps=5, floor_pool=128, eval_every=6, diag_every=3, min_dwell=2, window=5,
+              probe_n=128, mlp_n=256, mlp_steps=5, ret_every=4, rec_diff=True, shadow_rec=4.0)
+    f = run(cfg, tmp_path, verbose=False)["final"]
+    assert math.isfinite(f["shadow_rec_mse"]) and f["shadow_rec_mse"] > 0
+    assert all(math.isfinite(f[f"sh_r2_{g}"]) for g in GROUPS)

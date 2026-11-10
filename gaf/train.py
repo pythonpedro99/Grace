@@ -110,6 +110,11 @@ class Cfg:
     ret_lag: float = 0.999  # lag of the shadow predictor's copy that defines "still learning"
     ret_eps_g: float = 0.02  # relative improvement above which a direction counts as unsettled
     ret_eps_f: float = 0.1  # excess of the live predictor over the floor that keeps retention
+    # shadow reconstructs frame differences x_t - x_{t-1} from the pair (z_{t-1}, z_t) instead of
+    # the frames: static content (the grid world's map) cancels, so what changes (facing, hand,
+    # agent, mob) carries much more of the loss. Differences have ~1/3.6 of the frame MSE in the
+    # grid world: raise shadow_rec to compensate. Off: plain frame reconstruction.
+    rec_diff: bool = False
 
     @property
     def run_id(self) -> str:
@@ -126,7 +131,7 @@ class Cfg:
 
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
-                "ret_eps_f": 0.1}
+                "ret_eps_f": 0.1, "rec_diff": False}
 _LATE_ENV_FIELDS = {"swap_colors": False}
 
 
@@ -179,7 +184,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     if use_ret:  # shadow encoder (+ decoder), shadow predictor, retention head, reference map
         shadow, Qs = Encoder(D, cfg.env.res).to(dev), Predictor(D, T, env.act_dim).to(dev)
         Qs_lag = frozen_copy(Qs)
-        dec = Decoder(D, cfg.env.res).to(dev) if cfg.shadow_rec > 0 else None
+        dec = (Decoder(D * (2 if cfg.rec_diff else 1), cfg.env.res).to(dev)
+               if cfg.shadow_rec > 0 else None)
         Rh = torch.nn.Linear(D, D).to(dev)
         s_params = [*shadow.parameters(), *Qs.parameters(), *(dec.parameters() if dec else [])]
         opt_s = torch.optim.AdamW(s_params, cfg.lr, weight_decay=cfg.wd)
@@ -234,7 +240,11 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             loss_s = ((qp - zs_t).pow(2).mean()
                       + cfg.lam * sigreg(zs.transpose(0, 1), cfg.n_slices))
             if dec is not None:
-                rec = (dec(zs) - clip.x).pow(2).mean()
+                if cfg.rec_diff:  # the change between consecutive frames, from the pair of latents
+                    rec = (dec(torch.cat([zs[:, :-1], zs[:, 1:]], -1))
+                           - (clip.x[:, 1:] - clip.x[:, :-1])).pow(2).mean()
+                else:
+                    rec = (dec(zs) - clip.x).pow(2).mean()
                 loss_s = loss_s + cfg.shadow_rec * rec
                 acc["shadow_rec_mse"].append(rec.item())  # the reconstruction term of shadow_loss
             opt_s.zero_grad(set_to_none=True)
