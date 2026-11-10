@@ -78,7 +78,14 @@ satisfy SIGReg: `premise()` at D = 32 gives 4.0 for slow plus copies, against 1.
 `make_env` picks the env from the config type (`GridCfg` or `EnvCfg`), so every arm and analysis works on both.
 `capacity()` measures which latent size D the content needs, and `A.parts_r2()` reports R² per part (inventory and
 position inside slow, mob and tiles inside noise). D = 32 in the notebook is provisional until its stage 2b has run.
-Knobs: `W`, `H`, `tile`, `n_slow`, `levels`, `hud_p`, `density`, `random_map`, `n_twinkle`.
+Knobs: `W`, `H`, `tile`, `n_slow`, `levels`, `hud_p`, `density`, `random_map`, `n_twinkle`, and for the mass experiments
+`hand_tiles` (the hand shown in k HUD tiles), `compass_tiles` (the facing also shown in fixed HUD tiles) and `hand_p` (the hand tiles
+visible in a share of the clips; hidden ones show the average hand colour). `component_masses()` gives each component's share of the
+pixel variance, and `f["tile_class"]` the ground-truth class of every tile.
+
+`grid_mass_law.ipynb` tests the working rule "a class is held only if its share m of the pixel variance satisfies m · D ≥ κ": the
+hand's mass against the latent size D (SIGReg alone and an autoencoder), frequency against size, a fixed-location facing, the recipe
+(`sg`, a head start and `retain_open` below and above the threshold), and a class-balanced reconstruction loss (`rec_class_power`).
 
 ## Arms (`gaf/train.py`)
 
@@ -98,6 +105,7 @@ projected).
 | `block` | masked to the open directions | `g_open` | experimental: the encoder gets the prediction loss only in the open directions, through both paths |
 | `retain` | `g_ctx` + retention | none | experimental, unsupervised: reference-gated retention alone (`docs/reference_gated_retention.md`) |
 | `retain_open` | `g_ctx` + retention | `g_open` | the same plus the floor-gated open path that removes noise |
+| `ae` | none | none | an autoencoder: reconstruction (`shadow_rec`) + SIGReg, no prediction loss; B's shadow encoder on its own |
 
 Every arm runs the same optimizer, gate and diagnostics, so the leak can be compared across arms.
 
@@ -230,6 +238,8 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
     tests/           CPU checks
     gain_attribution.ipynb   the clip world
     grid_benchmark.ipynb     the grid world (results in /workspace/results_grid)
+    sigreg_hypothesis.ipynb  does SIGReg select content by pixel mass? (clip world, and the SIGReg weight in the grid world)
+    grid_mass_law.ipynb      the mass law in the grid world (results in /workspace/results_masslaw)
 
 ## Cost
 
