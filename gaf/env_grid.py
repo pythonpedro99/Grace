@@ -24,6 +24,13 @@ Knobs for the mass experiments (grid_mass_law.ipynb), all off by default:
     compass_tiles  the facing is also shown in this many HUD tiles (a fixed-location copy of the marker)
     hand_contrast  the hand tiles' colour contrast against the average hand colour (1: the material colours; 0.5: a quarter of the
                    mass), for masses below one tile
+    agent_shape    "marker" (default): a white tile with a yellow half toward the facing; "arrow": the agent is a white arrow
+                   (4 rotations) on the terrain, so the facing is the agent's whole silhouette (as in Craftax, where the sprite changes with
+                   the facing)
+    mob_mode       "jump" (default): the mob jumps to a random free cell every frame (noise, group noise); "chase": n_mobs mobs persist and
+                   move one free step per frame, toward the agent with probability mob_chase (else a random step or none), blocked by
+                   materials, the agent and the border; the agent cannot walk into a mob. Predictable given the agent and the action, so
+                   their position is in the group fast (part mob)
     hand_p         per clip, the hand tiles are visible with this probability (frequency against size); hidden tiles show
                    the average hand colour, so being hidden adds no variance of its own (as an absent block in Craftax
                    shows ordinary terrain, not a blank)
@@ -73,6 +80,10 @@ class GridCfg:
     compass_tiles: int = 0  # HUD tiles that show the facing (0: only the marker on the agent)
     hand_p: float = 1.0  # probability per clip that the hand tiles are visible
     hand_contrast: float = 1.0  # contrast of the hand tiles against the average hand colour (mass scales with its square)
+    agent_shape: str = "marker"  # "marker" | "arrow"
+    mob_mode: str = "jump"  # "jump" | "chase"
+    n_mobs: int = 1  # chase mode only
+    mob_chase: float = 0.7  # chase mode: probability of a step toward the agent
 
     @property
     def res(self) -> int:
@@ -91,6 +102,8 @@ class GridEnv:
         assert c.n_slow + c.hand_tiles + c.compass_tiles <= (c.W - c.H) * c.W, \
             "the inventory, hand and compass tiles must fit the HUD rows"
         assert c.levels <= 10, "tile classes cover inventory levels 0..9"
+        assert c.agent_shape in ("marker", "arrow") and c.mob_mode in ("jump", "chase")
+        assert c.mob_mode == "chase" or c.n_mobs == 1, "n_mobs is for the chase mode"
         self.cfg, self.dev = c, device
         self.hide = set()  # components left out of the frame (component_masses): hand, compass, facing, agent, mob, twinkle, inventory
         gen = torch.Generator().manual_seed(c.seed)
@@ -106,8 +119,15 @@ class GridEnv:
         r = torch.arange(c.res, device=device) % c.tile < c.tile // 2
         yy, xx = r[:, None].expand(c.res, c.res), r[None, :].expand(c.res, c.res)
         self.face_mask = torch.stack([yy, ~yy, xx, ~xx])  # (4, res, res)
-        self.dims = {"slow": c.n_slow + 2, "fast": 4, "hard": N_MAT,
-                     "noise": 2 + c.n_twinkle}
+        # within-tile silhouettes of the arrow agent: up, down, left, right
+        t = c.tile
+        ramp = (torch.arange(t)[:, None] + 1) / 2  # half width of the arrow in row i
+        up = (torch.arange(t)[None, :] + 0.5 - t / 2).abs() <= ramp
+        arrows = torch.stack([up, up.flip(0), up.T, up.T.flip(1)])  # apex up, down, left, right
+        self.arrow_mask = arrows.repeat(1, c.W, c.W).to(device)  # (4, res, res)
+        chase = c.mob_mode == "chase"
+        self.dims = {"slow": c.n_slow + 2, "fast": 4 + (2 * c.n_mobs if chase else 0), "hard": N_MAT,
+                     "noise": c.n_twinkle + (0 if chase else 2)}
 
     def _maps(self, n, gen=None) -> torch.Tensor:
         """(n, H, W) materials; the twinkle cells are always floor."""
@@ -117,6 +137,22 @@ class GridEnv:
         m = torch.where(u < c.density, kind, torch.zeros_like(kind))
         m[:, self.tw_y.to(dev), self.tw_x.to(dev)] = EMPTY
         return m
+
+    def _chase(self, m, agent, pad, ni):
+        """One step of the mobs m (n, k, 2) given the agent's new cell: toward it along the longer axis with probability
+        mob_chase, else a random move (or none); a blocked step (material, border, the agent) leaves the mob where it is."""
+        c, dev = self.cfg, self.dev
+        n, k = m.shape[:2]
+        d = agent[:, None] - m
+        along_x = d[..., 0].abs() >= d[..., 1].abs()
+        zero = torch.zeros_like(d[..., 0])
+        toward = torch.where(along_x[..., None], torch.stack([d[..., 0].sign(), zero], -1),
+                             torch.stack([zero, d[..., 1].sign()], -1))
+        rnd = self.moves[torch.randint(ACT_DIM, (n, k), device=dev)]
+        q = m + torch.where((torch.rand(n, k, device=dev) < c.mob_chase)[..., None], toward, rnd)
+        free = pad[ni[:, None], q[..., 1].clamp(-1, c.H) + 1, q[..., 0].clamp(-1, c.W) + 1] == EMPTY
+        free = free & ~(q == agent[:, None]).all(-1)
+        return torch.where(free[..., None], q, m)
 
     def _rand_free(self, free, k=None):
         """Uniform free cell per clip (k: per clip and frame). free: (n, H, W) bool -> (..., 2) xy."""
@@ -139,6 +175,11 @@ class GridEnv:
 
         free = mat == EMPTY
         p, f = self._rand_free(free), torch.randint(4, (n,), device=dev)
+        chase = c.mob_mode == "chase"
+        if chase:  # mobs start on free cells other than the agent's
+            free0 = free.clone()
+            free0[ni, p[:, 1], p[:, 0]] = False
+            mob_t = [self._rand_free(free0, c.n_mobs)]  # (n, k, 2)
         a = torch.randint(ACT_DIM, (n, T - 1), device=dev)
         hud = [torch.randint(c.levels, (n, c.n_slow), device=dev)]
         P, Fc = [p], [f]
@@ -146,8 +187,13 @@ class GridEnv:
             mv = a[:, t] > 0
             f = torch.where(mv, a[:, t] - 1, f)
             q = p + self.moves[a[:, t]]
-            p = torch.where((at(q) == EMPTY)[:, None], q, p)
+            ok = at(q) == EMPTY
+            if chase:
+                ok = ok & ~(mob_t[-1] == q[:, None]).all(-1).any(-1)  # a mob blocks the agent
+            p = torch.where(ok[:, None], q, p)
             P.append(p)
+            if chase:
+                mob_t.append(self._chase(mob_t[-1], p, pad, ni))
             Fc.append(f)
             step = (torch.rand(n, c.n_slow, device=dev) < c.hud_p) * (
                 2 * torch.randint(2, (n, c.n_slow), device=dev) - 1)
@@ -158,7 +204,7 @@ class GridEnv:
         # materials at distance 1 and 2 along the four directions: all the hand can depend on
         local = torch.stack([at(P[:, t] + k * dirs[d]) for t in range(T) for k in (1, 2)
                              for d in range(4)], 1).view(n, T, 8)
-        mob = self._rand_free(free, T)  # (n, T, 2)
+        mob = torch.stack(mob_t, 1) if chase else self._rand_free(free, T)[:, :, None]  # (n, T, k, 2)
         tw = torch.rand(n, T, c.n_twinkle, device=dev)
         # the hand tiles' visibility per clip (drawn only when hand_p < 1: default clips are unchanged)
         vis = (torch.rand(n, device=dev) < c.hand_p if c.hand_p < 1
@@ -167,10 +213,12 @@ class GridEnv:
         def xy(v):  # integer xy -> [-1, 1]
             return torch.stack([v[..., 0] / (c.W - 1), v[..., 1] / (c.H - 1)], -1) * 2 - 1
 
+        mob_xy = xy(mob).flatten(-2)  # (n, T, 2k)
+        face = F.one_hot(Fc, 4).float()
         f_ = {"slow": torch.cat([hud / (c.levels - 1) * 2 - 1, xy(P)], -1),
-              "fast": F.one_hot(Fc, 4).float(),
+              "fast": torch.cat([face, mob_xy], -1) if chase else face,
               "hard": F.one_hot(hand, N_MAT).float(),
-              "noise": torch.cat([xy(mob), tw * 2 - 1], -1),
+              "noise": (tw * 2 - 1) if chase else torch.cat([mob_xy, tw * 2 - 1], -1),
               "local": F.one_hot(local, N_MAT).float().flatten(2),
               # the whole map, constant in a clip: not a group, for latent_determined_by()
               "map": F.one_hot(mat, N_MAT).float().flatten(1)[:, None].expand(-1, T, -1),
@@ -215,8 +263,9 @@ class GridEnv:
         cflat = cls.view(n, T, rows * c.W)
         ni, ti = torch.arange(n, device=dev)[:, None], torch.arange(T, device=dev)[None]
         if "mob" not in hide:
-            flat[ni, ti, mob[..., 1] * c.W + mob[..., 0]] = MOB.to(dev)
-            cflat[ni, ti, mob[..., 1] * c.W + mob[..., 0]] = TC["mob"]
+            idx = mob[..., 1] * c.W + mob[..., 0]  # (n, T, k)
+            flat[ni[..., None], ti[..., None], idx] = MOB.to(dev)
+            cflat[ni[..., None], ti[..., None], idx] = TC["mob"]
         agent = torch.zeros(n, T, rows * c.W, device=dev, dtype=torch.bool)
         if "agent" not in hide:
             agent[ni, ti, P[..., 1] * c.W + P[..., 0]] = True
@@ -224,18 +273,24 @@ class GridEnv:
         up = c.tile
         x = g.repeat_interleave(up, 2).repeat_interleave(up, 3)  # (n, T, res, res, 3)
         am = agent.view(n, T, rows, c.W).repeat_interleave(up, 2).repeat_interleave(up, 3)
-        half = self.face_mask[Fc]  # (n, T, res, res)
-        face = AGENT if "facing" in hide else FACE
-        x = torch.where((am & half)[..., None], face.to(dev),
-                        torch.where(am[..., None], AGENT.to(dev), x))
+        if c.agent_shape == "arrow":  # the silhouette is the facing; hiding the facing fixes it to "up"
+            sil = self.arrow_mask[torch.zeros_like(Fc) if "facing" in hide else Fc]
+            x = torch.where((am & sil)[..., None], AGENT.to(dev), x)
+        else:
+            half = self.face_mask[Fc]  # (n, T, res, res)
+            face = AGENT if "facing" in hide else FACE
+            x = torch.where((am & half)[..., None], face.to(dev),
+                            torch.where(am[..., None], AGENT.to(dev), x))
         return (x * 2 - 1).permute(0, 1, 4, 2, 3).contiguous(), cflat
 
     def parts(self) -> dict:
         """Named parts of the groups: part -> (group, columns within the group)."""
-        n = self.cfg.n_slow
+        c = self.cfg
+        n = c.n_slow
+        mob, tw = (("fast", slice(4, 4 + 2 * c.n_mobs)), ("noise", slice(0, c.n_twinkle))) if c.mob_mode == "chase" \
+            else (("noise", slice(0, 2)), ("noise", slice(2, 2 + c.n_twinkle)))
         return {"inventory": ("slow", slice(0, n)), "position": ("slow", slice(n, n + 2)),
-                "facing": ("fast", slice(0, 4)), "hand": ("hard", slice(0, N_MAT)),
-                "mob": ("noise", slice(0, 2)), "twinkle": ("noise", slice(2, 2 + self.cfg.n_twinkle))}
+                "facing": ("fast", slice(0, 4)), "hand": ("hard", slice(0, N_MAT)), "mob": mob, "twinkle": tw}
 
     def factors(self, clip: Clip, t: int = -1) -> torch.Tensor:
         """All groups at frame t, concatenated in GROUPS order: (n, sum of dims)."""

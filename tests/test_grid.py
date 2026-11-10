@@ -256,6 +256,65 @@ def test_cluster_classes_find_the_hand_without_labels():
     assert abs(share.sum().item() - 1) < 1e-4 and wg.max() <= 30 + 1e-4
 
 
+def test_arrow_agent_encodes_the_facing_in_its_silhouette():
+    env = GridEnv(GridCfg(W=12, H=8, agent_shape="arrow"), "cpu")
+    clip = env.sample(64)
+    cls = clip.f["tile_class"][:, -1]
+    for d in range(4):  # the four silhouettes differ, and each is a quarter-to-three-quarters of the tile
+        m = env.arrow_mask[d, :4, :4]
+        assert 6 <= int(m.sum()) <= 12
+        assert all((m != env.arrow_mask[e, :4, :4]).any() for e in range(4) if e != d)
+    assert ((cls >= TC["agent:up"]) & (cls <= TC["agent:right"])).flatten(1).any(1).all()  # the agent is drawn in every frame
+    m = component_masses(GridCfg(W=12, H=8, agent_shape="arrow"), n=128)
+    assert m["facing marker"] > 0.02  # the silhouette carries a few percent of the pixel variance
+
+
+def test_chase_mobs_persist_move_by_rule_and_are_predictable():
+    c = GridCfg(W=12, H=8, mob_mode="chase", n_mobs=2, mob_chase=0.8, T=6)
+    env = GridEnv(c, "cpu")
+    torch.manual_seed(0)
+    clip = env.sample(512)
+    assert env.dims["fast"] == 4 + 4 and env.dims["noise"] == c.n_twinkle
+    assert clip.f["fast"].shape[-1] == env.dims["fast"] and clip.f["noise"].shape[-1] == env.dims["noise"]
+    g, s = env.parts()["mob"]
+    assert g == "fast" and s == slice(4, 8)
+    mob = clip.f["fast"][..., 4:]  # (n, T, 4) xy in [-1, 1] of both mobs
+    xy = ((mob.view(*mob.shape[:2], 2, 2) + 1) / 2 * torch.tensor([c.W - 1, c.H - 1])).round().long()
+    pos = ((clip.f["slow"][..., -2:] + 1) / 2 * torch.tensor([c.W - 1, c.H - 1])).round().long()
+    assert (xy[..., 1] < c.H).all() and (xy[..., 0] < c.W).all()
+    assert not (xy == pos[:, :, None]).all(-1).any()  # a mob never shares the agent's cell
+    step = (xy[:, 1:] - xy[:, :-1]).abs().sum(-1)
+    assert step.max() <= 1  # one cell per frame
+    d0 = (pos[:, 1:, None] - xy[:, :-1]).abs().sum(-1)
+    d1 = (pos[:, 1:, None] - xy[:, 1:]).abs().sum(-1)
+    moved = step > 0
+    assert ((d1 < d0) & moved).sum() / moved.sum() > 0.6  # the moves are mostly toward the agent: predictable
+    assert (clip.f["tile_class"][:, -1] == TC["mob"]).sum(-1).float().mean() > 1.5  # both drawn
+
+
+def test_default_grid_env_is_unchanged_by_the_new_knobs():
+    env = GridEnv(GridCfg(), "cpu")
+    assert env.dims == {"slow": 18, "fast": 4, "hard": 4, "noise": 6}
+    assert env.parts()["mob"] == ("noise", slice(0, 2))
+
+
+def test_eval_time_part_probes_are_logged_and_curve_is_written_while_running(tmp_path):
+    import pandas as pd
+    cfg = Cfg(arm="retain_open", env=SMALL, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128,
+              mlp_n=256, mlp_steps=5, ret_every=4, lam=0.01, eval_parts=256)
+    seen = []
+
+    def on_step(step, phase):
+        f = tmp_path / cfg.run_id / "metrics.csv"
+        if phase == "eval" and step > 5 and f.exists():
+            seen.append(len(pd.read_csv(f)))  # the first eval's row is on disk while the run goes on
+
+    s = run(cfg, tmp_path, verbose=False, on_step=on_step)
+    h = pd.read_csv(tmp_path / cfg.run_id / "metrics.csv")
+    assert {"ev_pm_hand", "ev_pm_mob", "ev_sh_pm_hand", "ev_sh_pm_position"} <= set(h.columns) and len(h) == 2
+    assert seen and seen[0] >= 1 and "pm_hand" in s
+
+
 def test_visible_hand_probe():
     from gaf.probes import parts_probe
     env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.5), "cpu")

@@ -117,6 +117,88 @@ def execute(cfgs, out, workers: int = 1, progress: bool = True) -> None:
         raise RuntimeError(f"{len(errors)} run(s) failed: {names}")
 
 
+def launch(cfgs, out, workers: int = 1) -> int:
+    """Start `cfgs` in a background process (python -m gaf.launch) that outlives the notebook's kernel and returns its pid at once.
+    Its output is <out>/launch.log; progress(out, cfgs) shows where the runs are, live_probes() plots them. Finished runs are skipped
+    (a run cannot resume: an interrupted one starts again). Refuses to start while an earlier launch in `out` is still alive."""
+    import pickle
+    import subprocess
+    import sys
+
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    pidf = out / "launch.pid"
+    if pidf.exists():
+        try:
+            os.kill(int(pidf.read_text()), 0)
+            raise RuntimeError(f"a launch is still running in {out} (pid {pidf.read_text()}); kill it first or wait")
+        except (ProcessLookupError, ValueError):
+            pass
+    pkl = out / "launch.pkl"
+    pkl.write_bytes(pickle.dumps(list(cfgs)))
+    with open(out / "launch.log", "a") as log:
+        proc = subprocess.Popen([sys.executable, "-m", "gaf.launch", str(pkl), str(out), str(workers)],
+                                stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    pidf.write_text(str(proc.pid))
+    return proc.pid
+
+
+def progress(out, cfgs) -> pd.DataFrame:
+    """Step, phase and state (waiting / running / done) of each cfg of a launch."""
+    rows = {}
+    for c in cfgs:
+        d = Path(out) / c.run_id
+        if (d / "summary.json").exists():
+            rows[_label(c)] = {"state": "done", "step": c.steps, "of": c.steps}
+            continue
+        try:
+            pr = json.loads((d / "progress.json").read_text())
+            rows[_label(c)] = {"state": "running", "step": pr["step"], "of": c.steps, "phase": pr["phase"]}
+        except (FileNotFoundError, ValueError):
+            rows[_label(c)] = {"state": "waiting", "step": 0, "of": c.steps}
+    return pd.DataFrame(rows).T
+
+
+PART_ORDER = ("hand", "position", "inventory", "facing", "mob", "twinkle")
+RUN_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
+
+
+def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done: bool = True, max_minutes: float | None = None):
+    """Per-part MLP probe readouts against the training step, redrawn every `every` seconds. runs: name -> Cfg (with eval_parts > 0).
+    One panel per part: solid = the live encoder, dashed = the shadow (retention arms); one colour per run. Stops when every run
+    has finished (or after max_minutes). Interrupting the cell stops only the plot, not the runs."""
+    from IPython.display import clear_output, display
+
+    t0 = time.time()
+    while True:
+        fig, axes = plt.subplots(2, (len(parts) + 1) // 2, figsize=(4.0 * ((len(parts) + 1) // 2), 6.4),
+                                 layout="constrained", sharex=True, sharey=True)
+        done = 0
+        for (name, c), col in zip(runs.items(), RUN_COLORS, strict=False):
+            d = Path(out) / c.run_id
+            done += (d / "summary.json").exists()
+            try:
+                h = pd.read_csv(d / "metrics.csv")
+            except (FileNotFoundError, pd.errors.EmptyDataError):
+                continue
+            for ax, part in zip(axes.flat, parts):
+                for key, ls, lab in ((f"ev_pm_{part}", "-", name), (f"ev_sh_pm_{part}", "--", f"{name} (shadow)")):
+                    if key in h:
+                        ax.plot(h["step"], h[key], color=col, ls=ls, label=lab)
+        for ax, part in zip(axes.flat, parts):
+            ax.set(title=part, ylim=(-0.2, 1.05))
+            ax.axhline(0.5, color=MUTED, lw=0.8, ls=":")
+        axes.flat[0].legend(loc="lower right", fontsize=7)
+        fig.suptitle("MLP probe R² of each part from z_t (solid: live encoder, dashed: shadow)  ·  " + "  ".join(
+            f"{n}: {progress(out, [c]).iloc[0]['step']}/{c.steps}" for n, c in runs.items()), fontsize=9)
+        clear_output(wait=True)
+        display(fig)
+        plt.close(fig)
+        if (until_done and done == len(runs)) or (max_minutes and time.time() - t0 > 60 * max_minutes):
+            return
+        time.sleep(every)
+
+
 def _execute_parallel(todo, out, workers, bar, advance) -> list:
     for c in todo:  # a progress file left by an interrupted attempt must not count
         (Path(out) / c.run_id / "progress.json").unlink(missing_ok=True)

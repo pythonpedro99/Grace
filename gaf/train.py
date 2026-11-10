@@ -129,6 +129,9 @@ class Cfg:
     # 0: ground-truth classes.
     rec_clusters: int = 0
     rec_pos_types: int = 6  # position types of the cluster classes (1: appearance only)
+    # grid world: at every eval, also the standardised MLP probe per named part (live encoder, and the shadow of retention arms),
+    # trained on this many clips (0: off); logged as ev_pm_<part>, ev_sh_pm_<part>. metrics.csv is then rewritten at every eval.
+    eval_parts: int = 0
 
     @property
     def run_id(self) -> str:
@@ -146,9 +149,9 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6}
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
-                    "hand_contrast": 1.0}
+                    "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
 
 
 def make_env(env_cfg, dev):
@@ -502,6 +505,11 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                                       + 0.5 * (rho[signal][:, None] == rho[noisy][None]).mean())
                                 if noisy.any() and signal.any() else float("nan"))
                 m.update(ref.summary())
+            if cfg.eval_parts and hasattr(env, "parts"):
+                kw = dict(n_train=cfg.eval_parts, n_test=2048, steps=400)
+                m.update(parts_probe(enc, env, prefix="ev_", **kw))
+                if use_ret:
+                    m.update(parts_probe(shadow, env, prefix="ev_sh_", **kw))
             row = {"step": step + 1, "n_S": int(st["inS"].sum()),
                    "gap_mean": st["gap"].mean().item(), "excess_med": st["excess"].median().item(),
                    **m}
@@ -517,6 +525,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                 dirs[k].append(v)
             dirs["content"].append(content)
             rows.append(row)
+            if cfg.eval_parts:  # a run watched while it trains (analysis.live_probes) needs the curve on disk
+                pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
             acc.clear()
             if verbose:
                 log(f"  [{cfg.arm} s{cfg.seed}] step {step + 1:>6}  loss {row['loss']:.4f}  "
