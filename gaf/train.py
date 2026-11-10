@@ -35,7 +35,8 @@ import torch
 from torch.func import functional_call, jvp
 from tqdm.auto import tqdm
 
-from .env import ACT_DIM, GROUPS, ClipEnv, EnvCfg
+from .env import GROUPS, ClipEnv, EnvCfg
+from .env_grid import GridCfg, GridEnv
 from .gate import FloorGate, floor_probe
 from .grads import SplitAdamW, vjp
 from .models import Decoder, Encoder, Predictor, ema_, frozen_copy, sigreg
@@ -129,6 +130,11 @@ _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam":
 _LATE_ENV_FIELDS = {"swap_colors": False}
 
 
+def make_env(env_cfg, dev):
+    """The environment of a config: GridEnv for a GridCfg, ClipEnv for an EnvCfg."""
+    return GridEnv(env_cfg, dev) if isinstance(env_cfg, GridCfg) else ClipEnv(env_cfg, dev)
+
+
 def device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -153,11 +159,11 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     odir.mkdir(parents=True, exist_ok=True)
     dev = device()
     torch.manual_seed(cfg.seed)
-    env = ClipEnv(cfg.env, dev)
+    env = make_env(cfg.env, dev)
     T, D, N = cfg.env.T, cfg.D, cfg.batch
     ctx_mode, tgt_mode = ARMS[cfg.arm]
 
-    enc, P = Encoder(D, cfg.env.res).to(dev), Predictor(D, T).to(dev)
+    enc, P = Encoder(D, cfg.env.res).to(dev), Predictor(D, T, env.act_dim).to(dev)
     P_lag = frozen_copy(P)
     enc_ema = frozen_copy(enc) if tgt_mode == "ema" else None
     tgt_enc = enc_ema or enc
@@ -171,7 +177,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                      cfg.floor_keep, cfg.floor_margin, cfg.soft)
     use_ret = cfg.arm in RETAIN_ARMS
     if use_ret:  # shadow encoder (+ decoder), shadow predictor, retention head, reference map
-        shadow, Qs = Encoder(D, cfg.env.res).to(dev), Predictor(D, T).to(dev)
+        shadow, Qs = Encoder(D, cfg.env.res).to(dev), Predictor(D, T, env.act_dim).to(dev)
         Qs_lag = frozen_copy(Qs)
         dec = Decoder(D, cfg.env.res).to(dev) if cfg.shadow_rec > 0 else None
         Rh = torch.nn.Linear(D, D).to(dev)
@@ -391,7 +397,8 @@ def load_model(cfg: Cfg, out):
     """(enc, P, target encoder) of a finished run, on the current device, eval mode."""
     dev = device()
     sd = torch.load(Path(out) / cfg.run_id / "model.pt", map_location=dev)
-    enc, P = Encoder(cfg.D, cfg.env.res).to(dev), Predictor(cfg.D, cfg.env.T).to(dev)
+    act_dim = make_env(cfg.env, "cpu").act_dim
+    enc, P = Encoder(cfg.D, cfg.env.res).to(dev), Predictor(cfg.D, cfg.env.T, act_dim).to(dev)
     enc.load_state_dict(sd["enc"])
     P.load_state_dict(sd["P"])
     tgt = enc
@@ -407,20 +414,24 @@ def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0,
     """Learnability on ground truth: a predictor from the true context factors (and actions)
     to the true target factors. Held-out R^2 per group over steps (slow fast, hard slower,
     noise ~0). actions=False hides the actions: fast and hard should then become unpredictable,
-    which confirms that they are action-conditioned. desc: label of a progress bar (None: none)."""
+    which confirms that they are action-conditioned. desc: label of a progress bar (None: none).
+    Inputs also include the env's `gt_extra` factors (grid world: the materials around the agent,
+    which the hand depends on but no group holds)."""
     dev = device()
     torch.manual_seed(seed)
-    env = ClipEnv(env_cfg, dev)
+    env = make_env(env_cfg, dev)
     cols = env.group_cols()
 
     def xy(clip):
-        x = torch.cat([clip.f[g][:, :-1] for g in GROUPS], -1).flatten(1)
+        x = torch.cat([clip.f[g][:, :-1] for g in (*GROUPS, *env.gt_extra)], -1).flatten(1)
         a = clip.a.flatten(1) if actions else torch.zeros_like(clip.a.flatten(1))
         return torch.cat([x, a], 1), env.factors(clip)
 
     d_in = sum(env.dims.values())
+    probe = env.sample(1, render=False)
+    d_x = sum(probe.f[g].shape[-1] for g in (*GROUPS, *env.gt_extra))
     net = torch.nn.Sequential(
-        torch.nn.Linear((d_in + ACT_DIM) * (env_cfg.T - 1), 256), torch.nn.GELU(),
+        torch.nn.Linear((d_x + env.act_dim) * (env_cfg.T - 1), 256), torch.nn.GELU(),
         torch.nn.Linear(256, 256), torch.nn.GELU(), torch.nn.Linear(256, d_in)).to(dev)
     opt = torch.optim.Adam(net.parameters(), 1e-3)
     xt, yt = xy(env.sample(8192, render=False))
@@ -438,6 +449,65 @@ def run_gt(env_cfg: EnvCfg = EnvCfg(), steps=5000, eval_every=100, seed=0,
     return pd.DataFrame(rows).set_index("step")
 
 
+def capacity(env_cfg, Ds=(16, 24, 32, 48, 64), steps=4000, batch=256, lam=0.1, lr=1e-3,
+             seed=0, groups=("slow", "fast", "hard"), eval_every=500, n_eval=4096,
+             desc: bool = True) -> pd.DataFrame:
+    """What latent size D can hold the content and support its prediction? An upper bound on what
+    any training of that size can reach: the real encoder on rendered frames, *supervised* with the
+    ground truth, plus SIGReg (weight lam) so the latent is shaped as in the real runs.
+
+    Per D: z = enc(x) for every frame; a linear head reads the current factors of `groups` from z
+    (readout, what z holds) and the predictor P(z_c, a) with a linear head predicts the target
+    frame's factors (prediction, what z supports). Held-out R^2 per group, every eval_every steps.
+    The smallest D at which every group reaches its plateau is the capacity the content needs; the
+    real runs also spend dimensions on unlabelled content (the map, noise), so leave room above it.
+    """
+    dev = device()
+    rows = []
+    for D in Ds:
+        torch.manual_seed(seed)
+        env = make_env(env_cfg, dev)
+        cols = env.group_cols()
+        sl = [cols[g] for g in groups]
+
+        def y_of(clip, t, sl=sl):
+            f = env.factors(clip, t)
+            return torch.cat([f[:, s] for s in sl], -1)
+
+        d_y = sum(s.stop - s.start for s in sl)
+        enc, P = Encoder(D, env_cfg.res).to(dev), Predictor(D, env_cfg.T, env.act_dim).to(dev)
+        read, pred = torch.nn.Linear(D, d_y).to(dev), torch.nn.Linear(D, d_y).to(dev)
+        params = [*enc.parameters(), *P.parameters(), *read.parameters(), *pred.parameters()]
+        opt = torch.optim.AdamW(params, lr, weight_decay=0.01)
+        with torch.no_grad():
+            ev = env.sample(n_eval)
+            y_ev, y_now = y_of(ev, -1), y_of(ev, -2)
+        T = env_cfg.T
+        for step in tqdm(range(1, steps + 1), desc=f"capacity D={D}", unit="step", disable=not desc):
+            clip = env.sample(batch)
+            z = enc(clip.x)  # (n, T, D)
+            y_all = torch.stack([y_of(clip, t) for t in range(T)], 1)
+            loss = ((read(z) - y_all).pow(2).mean()
+                    + (pred(P(z[:, :-1], clip.a)) - y_all[:, -1]).pow(2).mean()
+                    + lam * sigreg(z.transpose(0, 1)))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            if step % eval_every == 0 or step == steps:
+                with torch.no_grad():
+                    ze = torch.cat([enc(ev.x[i:i + 1024]) for i in range(0, n_eval, 1024)])
+                    yr, yp = read(ze[:, -2]), pred(P(ze[:, :-1], ev.a))
+                    row = {"D": D, "step": step, "sigreg": sigreg(ze.transpose(0, 1), 1024).item()}
+                    i = 0
+                    for g, s in zip(groups, sl, strict=True):
+                        j = i + s.stop - s.start
+                        row[f"read_{g}"] = r2(y_now[:, i:j], yr[:, i:j])
+                        row[f"pred_{g}"] = r2(y_ev[:, i:j], yp[:, i:j])
+                        i = j
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
 @torch.no_grad()
 def premise(env_cfg: EnvCfg = EnvCfg(), D: int = 32, n: int = 4096) -> pd.Series:
     """SIGReg of hand-made latents of size D: can slow content alone satisfy SIGReg?
@@ -449,7 +519,7 @@ def premise(env_cfg: EnvCfg = EnvCfg(), D: int = 32, n: int = 4096) -> pd.Series
                        only. Close to gaussian = the shortcut exists even with spare capacity.
     fast+hard          sprite factors, zero-padded
     """
-    env = ClipEnv(env_cfg, device())
+    env = make_env(env_cfg, device())
     clip = env.sample(n)
 
     def std(z):

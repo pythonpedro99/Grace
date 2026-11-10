@@ -12,11 +12,11 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from .env import GROUPS, ClipEnv
+from .env import GROUPS
 from .gate import floor_probe
 from .probes import ridge_r2
 from .models import Predictor
-from .train import Cfg, device, load_model, run
+from .train import Cfg, device, load_model, make_env, run
 
 BASELINES = ("lewm", "sg", "ema")
 FIXES = ("target", "context", "both")
@@ -249,7 +249,7 @@ def floors_of(cfg: Cfg, out, steps=3000, basis="excess", progress=True) -> pd.Da
     """
     torch.manual_seed(cfg.seed + 777)
     enc, P, tgt = load_model(cfg, out)
-    env = ClipEnv(cfg.env, device())
+    env = make_env(cfg.env, device())
     Ls, Q, _ = floor_probe(enc, tgt, env, steps=steps, lr=cfg.lr, wd=cfg.wd, basis=basis,
                            pred=P, desc=f"floor probe {cfg.arm} s{cfg.seed}" if progress else None)
     c = _content(enc, env, Q)
@@ -273,9 +273,9 @@ def latent_learning(cfg: Cfg, out, steps=20_000, eval_every=500, n_eval=8192, ba
     torch.manual_seed(cfg.seed + 4242)
     dev = device()
     enc, _, tgt = load_model(cfg, out)
-    env = ClipEnv(cfg.env, dev)
+    env = make_env(cfg.env, dev)
     cols = env.group_cols()
-    P = Predictor(cfg.D, cfg.env.T).to(dev)
+    P = Predictor(cfg.D, cfg.env.T, env.act_dim).to(dev)
     opt = torch.optim.AdamW(P.parameters(), cfg.lr, weight_decay=cfg.wd)
     with torch.no_grad():
         ev = env.sample(n_eval)
@@ -298,6 +298,21 @@ def latent_learning(cfg: Cfg, out, steps=20_000, eval_every=500, n_eval=8192, ba
     res = pd.DataFrame(rows).set_index("step")
     res.attrs["availability"] = availability
     return res
+
+
+@torch.no_grad()
+def parts_r2(cfgs: dict, out, n=8192) -> pd.DataFrame:
+    """Ridge R^2 of each named part of the env (env.parts(), e.g. grid world: inventory and position
+    inside slow, mob and twinkle inside noise) from z_t of finished runs. cfgs: {label: Cfg}."""
+    rows = {}
+    for lab, cfg in cfgs.items():
+        torch.manual_seed(cfg.seed + 99)
+        enc, _, _ = load_model(cfg, out)
+        env = make_env(cfg.env, device())
+        clip = env.sample(2 * n)
+        z = torch.cat([enc(clip.x[i:i + 2048, -1]) for i in range(0, 2 * n, 2048)])
+        rows[lab] = {p: ridge_r2(z, clip.f[g][:, -1, s], n) for p, (g, s) in env.parts().items()}
+    return pd.DataFrame(rows).T.round(3)
 
 
 # ---- figures ----------------------------------------------------------------------------------
@@ -456,7 +471,7 @@ def snapshot(df, out, runs: dict, steps=(0, 50, 100, 200, 500, 1000, 3000),
 
 def show_clips(env_cfg, n=4):
     """A few clips (rows) and their frames (columns), colours rescaled for display."""
-    env = ClipEnv(env_cfg, "cpu")
+    env = make_env(env_cfg, "cpu")
     torch.manual_seed(0)
     x = env.sample(n).x
     lo, hi = x.min(), x.max()

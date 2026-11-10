@@ -57,6 +57,29 @@ slow content alone is an exact isotropic Gaussian, is its own notebook stage (4b
 Knobs: `n_slow`, `slow_rho`, `n_noise`, `v_act`, `h_act` (action strength), `hard_k`
 (difficulty), `a_*` (salience), `swap_colors` (fast red / hard white), `pixel_noise`, `res`, `T`.
 
+## The grid world (`gaf/env_grid.py`, `grid_benchmark.ipynb`)
+
+The stepping stone to Craftax: the same four groups, but discrete, relational and Craftax-shaped. A 10×8 tile map with
+wood, stone and water (a new map per clip), two HUD rows below it, 40×40 pixels. Actions are one-hot over noop, up, down,
+left, right.
+
+| group | content | R² without the action |
+|---|---|---|
+| slow | 16 inventory slots (0–9 as tile brightness, ±1 with p = 0.03 per frame) and the agent's position | ≈ 0.99 |
+| fast | the agent's facing: a move turns it even when blocked (yellow half of the agent tile) | ≈ 0.03 |
+| hard | the hand: the material of the cell the agent faces after its action, shown in a HUD slot | ≈ 0.2 |
+| noise | a mob that jumps to a random free cell every frame, and 4 tiles with a random brightness | 0 |
+
+Why facing and hand, not positions: an agent that moves one cell per step is ≈ 95% predictable without the action, so
+its position is slow content and nothing would test the method. The hand is a pattern to learn: where the agent ends up,
+then what lies in front of it (on ground truth: R² 0.87 after 1000 steps, 0.95 after 2000). The inventory alone can
+satisfy SIGReg: `premise()` at D = 32 gives 4.0 for slow plus copies, against 1.2 for a Gaussian.
+
+`make_env` picks the env from the config type (`GridCfg` or `EnvCfg`), so every arm and analysis works on both.
+`capacity()` measures which latent size D the content needs, and `A.parts_r2()` reports R² per part (inventory and
+position inside slow, mob and tiles inside noise). D = 32 in the notebook is provisional until its stage 2b has run.
+Knobs: `W`, `H`, `tile`, `n_slow`, `levels`, `hud_p`, `density`, `random_map`, `n_twinkle`.
+
 ## Arms (`gaf/train.py`)
 
 Encoder gradient pieces (§2): `g_ctx` (context path), `g_tgt,S` (target path on the still-learning
@@ -195,15 +218,18 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
 ## Layout
 
     gaf/env.py       clip world with actions (EnvCfg, ClipEnv)
+    gaf/env_grid.py  grid world, the Craftax-shaped stepping stone (GridCfg, GridEnv)
     gaf/models.py    CNN encoder (GroupNorm, no BatchNorm), action predictor, SIGReg (LeWM-verified)
     gaf/retain.py    RefMap: reference floor and retention weights of reference-gated retention
     gaf/gate.py      FloorGate (gap, excess, hysteresis, basis rotation), floor_probe
     gaf/grads.py     flat VJPs, leak projection, SplitAdamW
     gaf/probes.py    ridge / MLP probes, probing suite
-    gaf/train.py     Cfg, ARMS, run(), run_gt() (learnability on ground truth), premise()
-    gaf/analysis.py  grids, collect, tables, verdicts, floors_of(), figures
+    gaf/train.py     Cfg, ARMS, make_env(), run(), run_gt() (learnability on ground truth), premise(),
+                     capacity() (which D the content needs)
+    gaf/analysis.py  grids, collect, tables, verdicts, floors_of(), parts_r2(), figures
     tests/           CPU checks
-    gain_attribution.ipynb
+    gain_attribution.ipynb   the clip world
+    grid_benchmark.ipynb     the grid world (results in /workspace/results_grid)
 
 ## Cost
 

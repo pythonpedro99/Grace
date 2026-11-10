@@ -86,6 +86,9 @@ def _bump(p: torch.Tensor, res: int, sigma: float) -> torch.Tensor:
 class ClipEnv:
     """Samples i.i.d. clips on `device`. Uses the global torch RNG (seed it per run)."""
 
+    act_dim = ACT_DIM
+    gt_extra = ()  # extra ground-truth inputs for run_gt (none here)
+
     def __init__(self, cfg: EnvCfg = EnvCfg(), device="cpu"):
         assert cfg.res % 8 == 0 and cfg.T >= 2
         self.cfg, self.dev = cfg, device

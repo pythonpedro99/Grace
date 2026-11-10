@@ -214,6 +214,30 @@ Reading guide: the table at the end of notebook stage 7. If a head start keeps f
 schedule, not a better gradient rule. Candidates if not: anchoring S to a lagged encoder, or freezing the
 encoder's effect on S in the update.
 
+## Grid world (`grid_benchmark.ipynb`)
+
+The stepping stone between the clip world and Craftax: it tests the core models on discrete, relational content before
+the first real benchmark. Design decisions:
+- **Slow is the HUD, not a continuous field.** 16 inventory slots drawn as tile brightness, i.i.d. per clip. Checked
+  before building, on ground truth: an encoder from the slots to D = 32 trained on SIGReg alone reaches SIGReg ≈ 6, like
+  the clip world's Gaussian slow factors (≈ 6.5), but only when each slot enters as an intensity. Fed as one-hot glyphs,
+  it stays at ≈ 23–34.
+- **Facing and hand instead of positions.** One-cell moves leave a position ≈ 95% predictable without the action (cap
+  0.95, against 0.25 in the clip world), so positions are slow content. Facing (cap 0.03) is fast. The hand, the material
+  in front of the agent after its action (cap ≈ 0.2), is hard: it needs the action and the blocks around the agent.
+- **Random map per clip**, as in Craftax. The latent must then hold the blocks around the agent, which costs room.
+  `capacity()` (stage 2b) measures the D the content needs; D = 32 is provisional until it has run.
+- **One seed per stage.** The last cell of the notebook adds seeds 1 and 2 (optional).
+- **Arms:** `detached` (availability, stage 2c), `lewm`, `sg`, `ema`, A (`target` + head start 3000 / 5000), the control
+  `sg` + head start, and B (`retain_open`). The ablations of B are skipped for now.
+
+Critical points:
+- If `sg` keeps facing and hand, the grid world tests nothing (criterion 1 of the notebook). Pressure: smaller D, more
+  inventory slots, lower `density`.
+- The hand is learned gradually on ground truth (no flat plateau as with the doubling map). If A keeps it with a short
+  head start, it is easier than the clip world's hard sprite; `density` is the knob.
+- The mob is the key noise test: a sprite like the agent, separable from it only by its dynamics.
+
 ## Open
 - **Not run on a GPU yet.** Only CPU tests and a tiny dry run of the notebook have run.
   `eps_g`, `eps_f`, `delta` and `min_dwell` are first guesses.
