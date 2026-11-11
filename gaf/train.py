@@ -136,6 +136,11 @@ class Cfg:
     # early stopping once settled (needs eval_parts; `steps` is then only the cap): at an eval, every ev_pm_* / ev_sh_pm_* readout changed
     # by less than settle_tol_change between the eval `settle_window` steps back and now and swung by less than settle_tol_swing inside
     # that window, at settle_patience evals in a row, and at least settle_min_steps are done. 0: off.
+    # retention floor for content that is hard to predict but not noise (RefMap): directions whose shadow coordinate has a lag-1
+    # autocorrelation of ret_ac (full effect; 0: off) between consecutive frames keep a retention weight of at least ret_w_min
+    ret_ac: float = 0.0
+    ret_w_min: float = 0.3
+    ret_floor_all: bool = False  # the unconditional floor: every direction keeps a retention weight of at least ret_w_min
     settle_window: int = 0
     settle_min_steps: int = 15_000
     settle_patience: int = 2
@@ -158,7 +163,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "settle_window": 0, "settle_min_steps": 15_000,
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "settle_window": 0, "settle_min_steps": 15_000,
                 "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
@@ -328,7 +333,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         s_params = [*shadow.parameters(), *Qs.parameters(), *(dec.parameters() if dec else [])]
         opt_s = torch.optim.AdamW(s_params, cfg.lr, weight_decay=cfg.wd)
         opt_r = torch.optim.AdamW(Rh.parameters(), cfg.lr, weight_decay=cfg.wd)
-        ref = RefMap(D, dev, cfg.ret_tau, cfg.ret_every, cfg.ret_eps_g, cfg.ret_eps_f)
+        ref = RefMap(D, dev, cfg.ret_tau, cfg.ret_every, cfg.ret_eps_g, cfg.ret_eps_f, ac_ref=cfg.ret_ac, w_min=cfg.ret_w_min,
+                     floor_all=cfg.ret_floor_all)
     use_ae = cfg.arm in AE_ARMS
     if use_ae:  # the autoencoder's decoder (its encoder is `enc`)
         ae_dec = Decoder(D, cfg.env.res).to(dev)
@@ -423,7 +429,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             enc_aux = sig + cfg.ret_lam * L_ret
             gR = torch.autograd.grad(cfg.ret_lam * L_ret, list(Rh.parameters()), retain_graph=True)
             with torch.no_grad():
-                ref.update(zs.detach().flatten(0, 1), r, r_lag, Rh(p.detach()) - y[:, -1])
+                ref.update(zs.detach().flatten(0, 1), r, r_lag, Rh(p.detach()) - y[:, -1],
+                           pairs=(zs[:, :-1].detach().flatten(0, 1), zs[:, 1:].detach().flatten(0, 1)) if cfg.ret_ac > 0 else None)
             acc["ret_loss"].append(L_ret.item())
             acc["shadow_loss"].append(loss_s.item())
 
@@ -521,12 +528,13 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                 m_sh, c_sh = probe_suite(shadow, Qs, env, ref.basis(), cfg.probe_n)
                 m.update({f"sh_{k}": v for k, v in m_sh.items()
                           if k.startswith(("r2_", "pred_r2_"))})
-                c, rho = c_sh.numpy(), ref.rho.cpu().numpy()
+                c, rho, wt = c_sh.numpy(), ref.rho.cpu().numpy(), ref.w.cpu().numpy()
                 dom, top = c.argmax(1), c.max(1)  # direction -> the group it carries most
                 for gi, g in enumerate(GROUPS):  # mean rho and count of the directions of a group
                     mg = (dom == gi) & (top > 0.15)
                     m[f"ref_rho_{g}"] = float(rho[mg].mean()) if mg.any() else float("nan")
                     m[f"ref_n_{g}"] = int(mg.sum())
+                    m[f"ref_w_{g}"] = float(wt[mg].mean()) if mg.any() else float("nan")  # retention weight on that group's directions
                 noisy, signal = (dom == 3) & (top > 0.15), (dom != 3) & (top > 0.15)
                 m["ref_auc"] = (float((rho[signal][:, None] > rho[noisy][None]).mean()
                                       + 0.5 * (rho[signal][:, None] == rho[noisy][None]).mean())

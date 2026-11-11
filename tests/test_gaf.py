@@ -353,6 +353,59 @@ def test_refmap_retains_everything_while_the_shadow_still_learns():
     assert ref.w.min() > 0.9  # unsettled: retained, whatever rho says (protect by default)
 
 
+def _ac_refmap(ac_ref, n=6000, seed=0):
+    """2 shadow dims, both unpredictable (residual 0.9, 1.1): dim 0 is correlated between consecutive frames (0.6), dim 1 is i.i.d."""
+    from gaf.retain import RefMap
+    g = torch.Generator().manual_seed(seed)
+    ref = RefMap(2, "cpu", tau=0.0, every=1, eps_g=0.02, eps_f=0.1, ac_ref=ac_ref, w_min=0.3)
+    za = torch.randn(n, 2, generator=g)
+    zb = torch.stack([0.6 * za[:, 0] + 0.8 * torch.randn(n, generator=g), torch.randn(n, generator=g)], 1)
+    r = torch.randn(n, 2, generator=g) * torch.tensor([0.9, 1.1]) ** 0.5
+    e_live = torch.randn(n, 2, generator=g)
+    ref.update(torch.cat([za, zb]), r, r * 1.0, e_live, pairs=(za, zb))
+    return ref
+
+
+def test_refmap_autocorrelation_floor_keeps_hard_content_and_frees_noise():
+    off, on = _ac_refmap(0.0), _ac_refmap(0.1)
+    i = off.rho.argmax()  # the more predictable direction is dim 0 (residual 0.9)
+    assert off.w[i] < 0.15  # without the floor, unpredictable content is released like noise
+    assert on.w[i] >= 0.29 and on.ac[i] > 0.4  # the autocorrelated direction is held at w_min
+    assert on.w[1 - i] < 0.1 and abs(on.ac[1 - i]) < 0.1  # the i.i.d. one is still free
+    assert on.summary()["ref_ac_n"] == 1
+
+
+def test_refmap_unconditional_floor_holds_every_direction():
+    from gaf.retain import RefMap
+    g = torch.Generator().manual_seed(1)
+    ref = RefMap(4, "cpu", tau=0.0, every=1, eps_g=0.02, eps_f=0.1, w_min=0.3, floor_all=True)
+    z = torch.randn(4000, 4, generator=g)
+    r = torch.randn(4000, 4, generator=g) * torch.tensor([0.05, 0.05, 1.0, 1.0]) ** 0.5
+    ref.update(z, r, r, torch.randn(4000, 4, generator=g) * torch.tensor([0.05, 0.05, 1.0, 1.0]) ** 0.5)
+    assert ref.w.min() >= 0.3 - 1e-6  # noise directions are no longer free; released signal sits at the floor, not below
+    assert ref.summary()["ref_ac_n"] == 0  # the autocorrelation floor is off
+
+
+def test_launch_skips_finished_and_running_runs(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    from gaf import analysis as A
+    a, b, c = (Cfg(arm="retain_open", seed=s, **TINY) for s in (1, 2, 3))
+    for cfg, state in ((a, "done"), (b, "running")):
+        d = tmp_path / cfg.run_id
+        d.mkdir()
+        (d / ("summary.json" if state == "done" else "progress.json")).write_text(json.dumps({"step": 1, "phase": "train"}))
+    started = []
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: started.append(cmd) or type("P", (), {"pid": 1})())
+    assert A.launch([a, b, c], tmp_path, workers=2) == 1
+    import pickle
+    assert [x.seed for x in pickle.loads(next(tmp_path.glob("launch_*.pkl")).read_bytes())] == [3]  # only the new run
+    assert A.launch([a, b], tmp_path) is None  # nothing left to start
+    assert json.loads((tmp_path / c.run_id / "progress.json").read_text())["phase"] == "queued"  # claimed at once
+    assert A.launch([c], tmp_path) is None  # so an immediate second launch does not start it again
+
+
 @pytest.mark.parametrize(("arm", "rec"), [("retain", 1.0), ("retain_open", 1.0), ("retain", 0.0)])
 def test_retention_arms_run_and_log_the_reference(arm, rec, tmp_path):
     cfg = Cfg(arm=arm, shadow_rec=rec, ret_every=5, **TINY)

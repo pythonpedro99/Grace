@@ -18,29 +18,43 @@ retention weights for the live encoder:
     settled and predictable (rho > 0): retained until the live predictor has caught up;
     settled and unpredictable (rho = 0, noise): free.
     Before the first refresh everything is retained.
+
+Optional floor (ac_ref > 0): content that is hard to predict is not noise. A direction whose coordinate is correlated between
+consecutive frames, ac_j = v_j' (W C1 W) v_j with C1 the lag-1 cross covariance of the shadow latent, is not i.i.d. noise (the grid
+world: twinkle 0.00, hand 0.34, facing 0.20), so
+    w_j = max(w_j, w_min * clip(ac_j / ac_ref, 0, 1)),
+i.e. it is never released below w_min, however badly the shadow predictor predicts it. Costs live capacity for every
+autocorrelated direction (static content too).
+floor_all: the unconditional version, w_j = max(w_j, w_min) for every direction: nothing the shadow represents is released
+below w_min, whatever its predictability or autocorrelation (noise is then left to the open target path only).
 """
 import torch
 
 
 class RefMap:
-    def __init__(self, D, device, tau=0.995, every=50, eps_g=0.02, eps_f=0.1, delta=0.01):
+    def __init__(self, D, device, tau=0.995, every=50, eps_g=0.02, eps_f=0.1, delta=0.01, ac_ref=0.0, w_min=0.3, floor_all=False):
         self.D, self.dev, self.tau, self.every = D, device, tau, every
+        self.ac_ref, self.w_min, self.floor_all = ac_ref, w_min, floor_all
         self.eps_g, self.eps_f, self.delta = eps_g, eps_f, delta
         eye = torch.eye(D, device=device)
         self.mu = torch.zeros(D, device=device)
         self.W, self.V, self.M = eye.clone(), eye.clone(), eye.clone()
         ones, zeros = torch.ones(D, device=device), torch.zeros(D, device=device)
         self.w, self.err, self.err_live = ones.clone(), ones.clone(), ones.clone()
-        self.rho, self.gap, self.u = zeros.clone(), zeros.clone(), ones.clone()
+        self.rho, self.gap, self.u, self.ac = zeros.clone(), zeros.clone(), ones.clone(), zeros.clone()
         self.C, self.n = None, 0
 
     @torch.no_grad()
-    def update(self, z, r, r_lag, e_live):
+    def update(self, z, r, r_lag, e_live, pairs=None):
         """z: shadow latents (M, D); r, r_lag: residuals of the shadow predictor and of its
         lagged copy (N, D); e_live: live prediction mapped into shadow coordinates, minus the
-        whitened shadow target (N, D). Fresh clips every step, so these are held-out errors."""
+        whitened shadow target (N, D). Fresh clips every step, so these are held-out errors.
+        pairs: (z_t, z_t+1) of consecutive frames (K, D) each, for the autocorrelation floor (ac_ref > 0)."""
         sec = lambda x: x.T @ x / len(x)  # noqa: E731
         new = {"g": torch.cov(z.T), "r": sec(r), "rl": sec(r_lag), "el": sec(e_live)}
+        if self.ac_ref > 0 and pairs is not None:
+            za, zb = pairs
+            new["c1"] = (za - za.mean(0)).T @ (zb - zb.mean(0)) / len(za)
         self.C = new if self.C is None else {k: torch.lerp(self.C[k], v, 1 - self.tau)
                                              for k, v in new.items()}
         mu = z.mean(0)
@@ -65,6 +79,11 @@ class RefMap:
         self.u = (self.gap / self.eps_g).clamp(0, 1)
         rel = ((self.err_live - self.err) / self.eps_f).clamp(0, 1)
         self.w = torch.maximum(self.u, self.rho * rel)
+        if self.ac_ref > 0 and "c1" in C:  # hard is not noise: autocorrelated directions keep at least w_min
+            self.ac = diag(sym(self.W @ C["c1"] @ self.W))
+            self.w = torch.maximum(self.w, self.w_min * (self.ac / self.ac_ref).clamp(0, 1))
+        if self.floor_all:
+            self.w = self.w.clamp_min(self.w_min)
         self.M = (V * self.w) @ V.T
 
     def basis(self):
@@ -73,4 +92,5 @@ class RefMap:
 
     def summary(self) -> dict:
         return {"ref_w": self.w.mean().item(), "ref_rho": self.rho.mean().item(),
-                "ref_unsettled": int((self.u > 0.5).sum()), "ref_free": int((self.w < 0.1).sum())}
+                "ref_unsettled": int((self.u > 0.5).sum()), "ref_free": int((self.w < 0.1).sum()),
+                "ref_ac_n": int((self.ac > self.ac_ref).sum()) if self.ac_ref > 0 else 0}

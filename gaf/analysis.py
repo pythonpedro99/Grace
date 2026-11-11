@@ -117,29 +117,41 @@ def execute(cfgs, out, workers: int = 1, progress: bool = True) -> None:
         raise RuntimeError(f"{len(errors)} run(s) failed: {names}")
 
 
-def launch(cfgs, out, workers: int = 1) -> int:
-    """Start `cfgs` in a background process (python -m gaf.launch) that outlives the notebook's kernel and returns its pid at once.
-    Its output is <out>/launch.log; progress(out, cfgs) shows where the runs are, live_probes() plots them. Finished runs are skipped
-    (a run cannot resume: an interrupted one starts again). Refuses to start while an earlier launch in `out` is still alive."""
+def launch(cfgs, out, workers: int = 1, running_within: float = 600) -> int | None:
+    """Start `cfgs` in a background process (python -m gaf.launch) that outlives the notebook's kernel; returns its pid at once.
+    Its output is <out>/launch_<time>.log, its pid <out>/launch_<time>.pid (kill the group: kill -TERM -- -$(cat <out>/launch_*.pid)).
+    Finished runs are skipped, and so are runs another launch is working on (progress.json touched within `running_within` seconds),
+    so a second launch only adds the new runs. A run cannot resume: an interrupted one starts again (wait `running_within` seconds
+    after killing it, or delete its folder, before relaunching). Returns None if there is nothing to start."""
     import pickle
     import subprocess
     import sys
 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    pidf = out / "launch.pid"
-    if pidf.exists():
-        try:
-            os.kill(int(pidf.read_text()), 0)
-            raise RuntimeError(f"a launch is still running in {out} (pid {pidf.read_text()}); kill it first or wait")
-        except (ProcessLookupError, ValueError):
-            pass
-    pkl = out / "launch.pkl"
-    pkl.write_bytes(pickle.dumps(list(cfgs)))
-    with open(out / "launch.log", "a") as log:
+    todo, busy = [], []
+    for c in cfgs:
+        d = out / c.run_id
+        if (d / "summary.json").exists():
+            continue
+        pf = d / "progress.json"
+        (busy if pf.exists() and time.time() - pf.stat().st_mtime < running_within else todo).append(c)
+    if busy:
+        print("already running (progress updated within", f"{running_within:.0f}s), not started again:", ", ".join(_label(c) for c in busy))
+    if not todo:
+        print("nothing to start")
+        return None
+    for c in todo:  # claim the runs at once: a second launch must see them as taken before the workers have written anything
+        (out / c.run_id).mkdir(exist_ok=True)
+        (out / c.run_id / "progress.json").write_text(json.dumps({"step": 0, "phase": "queued"}))
+    base = out / f"launch_{time.strftime('%Y%m%d_%H%M%S')}"
+    pkl = base.with_suffix(".pkl")
+    pkl.write_bytes(pickle.dumps(todo))
+    with open(base.with_suffix(".log"), "a") as log:
         proc = subprocess.Popen([sys.executable, "-m", "gaf.launch", str(pkl), str(out), str(workers)],
                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    pidf.write_text(str(proc.pid))
+    base.with_suffix(".pid").write_text(str(proc.pid))
+    print("started", ", ".join(_label(c) for c in todo), f"(pid {proc.pid}, log {base.with_suffix('.log')})")
     return proc.pid
 
 
@@ -162,7 +174,7 @@ def progress(out, cfgs) -> pd.DataFrame:
 
 PART_ORDER = ("hand", "position", "inventory", "facing", "mob", "twinkle")
 FLOOR = -0.5  # live_probes draws R² below this at the bottom edge instead of off the chart
-RUN_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
+RUN_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#6250d6", "#e34948")
 
 
 def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done: bool = True, max_minutes: float | None = None):

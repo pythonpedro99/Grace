@@ -216,7 +216,9 @@ def test_component_masses_grow_with_the_tiles():
 
 @pytest.mark.parametrize("kw", [dict(arm="ae"), dict(arm="ae", rec_class_power=0.5), dict(arm="retain_open", rec_class_power=1.0),
                                 dict(arm="ae", rec_class_power=1.0, rec_clusters=8, rec_pos_types=3),
-                                dict(arm="retain_open", rec_class_power=1.0, rec_clusters=8, rec_pos_types=3)])
+                                dict(arm="retain_open", rec_class_power=1.0, rec_clusters=8, rec_pos_types=3),
+                                dict(arm="retain_open", rec_class_power=1.0, ret_ac=0.1, ret_w_min=0.3),
+                                dict(arm="retain_open", ret_floor_all=True, ret_w_min=0.3)])
 def test_autoencoder_and_class_balanced_reconstruction_run(kw, tmp_path):
     cfg = Cfg(env=SMALL, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128,
               mlp_n=256, mlp_steps=5, ret_every=4, lam=0.01, **kw)
@@ -227,6 +229,7 @@ def test_autoencoder_and_class_balanced_reconstruction_run(kw, tmp_path):
         assert math.isfinite(s["final"]["ae_rec_mse"])
     else:
         assert "sh_pm_hand" in s
+        assert "ref_ac_n" in s["final"] and "ref_w_slow" in s["final"]
 
 
 def test_class_weights_lift_the_rare_classes():
