@@ -38,6 +38,31 @@ def encode(enc, x, chunk=4096):
     return torch.cat([enc(x[i:i + chunk]) for i in range(0, len(x), chunk)])
 
 
+def sample_chunked(env, n, chunk=2048):
+    """env.sample(n) built from chunks of `chunk` clips and concatenated: the renderer's temporary tensors are several times the size of
+    the frames, so one call for tens of thousands of clips can run a shared GPU out of memory."""
+    cs, left = [], n
+    while left > 0:
+        cs.append(env.sample(min(chunk, left)))
+        left -= len(cs[-1].a)
+    f = {k: torch.cat([c.f[k] for c in cs]) for k in cs[0].f}
+    return type(cs[0])(torch.cat([c.x for c in cs]), torch.cat([c.a for c in cs]), f)
+
+
+@torch.no_grad()
+def collect_last(enc, env, n, chunk=2048):
+    """z of the target frame, the factors of all groups and the hand-visibility flag (or None) of n fresh clips, chunk by chunk and
+    without keeping the frames."""
+    zs, ys, vs = [], [], []
+    for _ in range(0, n, chunk):
+        clip = env.sample(min(chunk, n - len(zs) * chunk))
+        zs.append(encode(enc, clip.x[:, -1]))
+        ys.append(env.factors(clip))
+        if "hand_visible" in clip.f:
+            vs.append(clip.f["hand_visible"][:, -1, 0])
+    return torch.cat(zs), torch.cat(ys), (torch.cat(vs) if vs else None)
+
+
 @torch.no_grad()
 def probe_suite(enc, P, env, Q=None, n=8192, enc_tgt=None):
     """Scalar metrics (dict) and per-direction content (D x groups) of the current model.
@@ -52,7 +77,7 @@ def probe_suite(enc, P, env, Q=None, n=8192, enc_tgt=None):
     enc_tgt = enc_tgt or enc
     was = enc.training
     enc.eval()
-    clip = env.sample(2 * n)
+    clip = sample_chunked(env, 2 * n)
     zc, zt = encode(enc, clip.x[:, :-1]), encode(enc_tgt, clip.x[:, -1])
     z_last = zt if enc_tgt is enc else encode(enc, clip.x[:, -1])
     z_all = torch.cat([zc, z_last[:, None]], 1)  # online encoder on every frame
@@ -81,9 +106,7 @@ def mlp_probe(enc, env, n_train=20000, n_test=8192, steps=1000, hidden=256):
     """Held-out 2-layer MLP probe from z_t to every group (rules out 'nonlinearly present')."""
     was = enc.training
     enc.eval()
-    with torch.no_grad():
-        clip = env.sample(n_train + n_test)
-        z, y = encode(enc, clip.x[:, -1]), env.factors(clip)
+    z, y, _ = collect_last(enc, env, n_train + n_test)
     enc.train(was)
     net = nn.Sequential(nn.Linear(z.shape[1], hidden), nn.GELU(), nn.Linear(hidden, hidden),
                         nn.GELU(), nn.Linear(hidden, y.shape[1])).to(z.device)
@@ -105,9 +128,7 @@ def parts_probe(enc, env, n_train=16000, n_test=8000, steps=2000, hidden=256, pr
     `<prefix>pm_hand_visible`, the hand read on the clips where it is shown."""
     was = enc.training
     enc.eval()
-    with torch.no_grad():
-        clip = env.sample(n_train + n_test)
-        z, y = encode(enc, clip.x[:, -1]), env.factors(clip)
+    z, y, vis = collect_last(enc, env, n_train + n_test)
     enc.train(was)
     out = {f"{prefix}pm_rank": eff_rank(z)}
     mu, sd = z[:n_train].mean(0), z[:n_train].std(0).clamp_min(1e-6)
@@ -127,9 +148,8 @@ def parts_probe(enc, env, n_train=16000, n_test=8000, steps=2000, hidden=256, pr
     for part, (g, s) in env.parts().items():
         sl = slice(cols[g].start + s.start, cols[g].start + s.stop)
         out[f"{prefix}pm_{part}"] = r2(yt[:, sl], yh[:, sl])
-    vis = clip.f.get("hand_visible")
-    if vis is not None and (vis[n_train:, -1, 0] < 0.5).any():
-        m = vis[n_train:, -1, 0] > 0.5
+    if vis is not None and (vis[n_train:] < 0.5).any():
+        m = vis[n_train:] > 0.5
         g, s = env.parts()["hand"]
         sl = slice(cols[g].start + s.start, cols[g].start + s.stop)
         out[f"{prefix}pm_hand_visible"] = r2(yt[m][:, sl], yh[m][:, sl])

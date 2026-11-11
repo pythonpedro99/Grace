@@ -4,6 +4,7 @@ import multiprocessing as mp
 import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from dataclasses import asdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -14,8 +15,8 @@ from tqdm.auto import tqdm
 
 from .env import GROUPS
 from .gate import floor_probe
-from .probes import r2, ridge_r2
-from .models import Predictor
+from .probes import mlp_probe, parts_probe, r2, ridge_r2
+from .models import Encoder, Predictor
 from .train import Cfg, device, load_model, make_env, run
 
 BASELINES = ("lewm", "sg", "ema")
@@ -117,6 +118,44 @@ def execute(cfgs, out, workers: int = 1, progress: bool = True) -> None:
         raise RuntimeError(f"{len(errors)} run(s) failed: {names}")
 
 
+def finalize(cfg: Cfg, out) -> dict:
+    """Write the missing summary.json (and model.pt) of a run that trained to the end but died in the final probes (e.g. a CUDA out of memory
+    when several runs reached that phase together): loads the checkpoint of the last step (needs cfg.ckpt_every), runs the final probes as
+    train.run does, and takes the `final` row from metrics.csv. Run it one run at a time. Returns the summary."""
+    import re
+    odir = Path(out) / cfg.run_id
+    if (odir / "summary.json").exists():
+        return json.loads((odir / "summary.json").read_text())
+    ck = max(odir.glob("ckpt_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+    step = int(ck.stem.split("_")[1])
+    assert step == cfg.steps, f"the last checkpoint is at step {step}, the run has {cfg.steps} steps: nothing to finalize from"
+    dev = device()
+    sd = torch.load(ck, map_location=dev)
+    env = make_env(cfg.env, dev)
+    enc = Encoder(cfg.D, cfg.env.res).to(dev)
+    enc.load_state_dict(sd["enc"])
+    enc.eval()
+    log = (odir / "log.txt").read_text() if (odir / "log.txt").exists() else ""
+    secs = re.findall(r"\((\d+)s\)", log)
+    last = json.loads(pd.read_csv(odir / "metrics.csv").iloc[[-1]].to_json(orient="records"))[0]
+    summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": float(secs[-1]) if secs else float("nan"), "steps_run": cfg.steps,
+               "final": last, **mlp_probe(enc, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps)}
+    if hasattr(env, "parts"):
+        kw = dict(n_train=cfg.mlp_n, n_test=cfg.probe_n, steps=2 * cfg.mlp_steps)
+        summary.update(parts_probe(enc, env, **kw))
+    if "shadow" in sd:
+        shadow = Encoder(cfg.D, cfg.env.res).to(dev)
+        shadow.load_state_dict(sd["shadow"])
+        shadow.eval()
+        if hasattr(env, "parts"):
+            summary.update(parts_probe(shadow, env, prefix="sh_", **kw))
+        summary.update({f"sh_{k}": v for k, v in mlp_probe(shadow, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps).items()})
+    torch.save({"enc": sd["enc"], "P": sd["P"], "enc_ema": None, **({"shadow": sd["shadow"], "dec": sd.get("dec")} if "shadow" in sd else {})},
+               odir / "model.pt")
+    (odir / "summary.json").write_text(json.dumps(summary))
+    return summary
+
+
 def launch(cfgs, out, workers: int = 1, running_within: float = 600) -> int | None:
     """Start `cfgs` in a background process (python -m gaf.launch) that outlives the notebook's kernel; returns its pid at once.
     Its output is <out>/launch_<time>.log, its pid <out>/launch_<time>.pid (kill the group: kill -TERM -- -$(cat <out>/launch_*.pid)).
@@ -177,21 +216,31 @@ FLOOR = -0.5  # live_probes draws R² below this at the bottom edge instead of o
 RUN_COLORS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#6250d6", "#e34948")
 
 
-def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done: bool = True, max_minutes: float | None = None):
+def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done: bool = True, max_minutes: float | None = None,
+                stale_minutes: float = 30):
     """Per-part MLP probe readouts against the training step, redrawn every `every` seconds. runs: name -> Cfg (with eval_parts > 0).
     One panel per part: solid = the live encoder, dashed = the shadow (retention arms); one colour per run; values below -0.5 sit on
     the bottom edge (a probe can be far below zero early on), a marker per eval. Stops when every run
-    has finished (or after max_minutes). Interrupting the cell stops only the plot, not the runs."""
+    has finished (or after max_minutes). A run whose progress.json has not been touched for stale_minutes and that wrote no summary is
+    treated as dead (killed or crashed): it is reported once and no longer waited for. Interrupting the cell stops only the plot, not the runs."""
     from IPython.display import clear_output, display
 
-    t0 = time.time()
+    t0, dead = time.time(), set()
     while True:
         fig, axes = plt.subplots(2, (len(parts) + 1) // 2, figsize=(4.0 * ((len(parts) + 1) // 2), 6.4),
                                  layout="constrained", sharex=True, sharey=True)
         done = 0
         for (name, c), col in zip(runs.items(), RUN_COLORS, strict=False):
             d = Path(out) / c.run_id
-            done += (d / "summary.json").exists()
+            pf = d / "progress.json"
+            if (d / "summary.json").exists():
+                done += 1
+            elif pf.exists() and time.time() - pf.stat().st_mtime > 60 * stale_minutes:
+                done += 1
+                if name not in dead:
+                    dead.add(name)
+                    print(f"{name}: no progress for {stale_minutes:.0f} min and no summary - killed or crashed, not waiting for it "
+                          f"(see {d / 'log.txt'} and the launch log in {out})")
             try:
                 h = pd.read_csv(d / "metrics.csv")
             except (FileNotFoundError, pd.errors.EmptyDataError):
@@ -205,7 +254,8 @@ def live_probes(out, runs: dict, parts=PART_ORDER, every: float = 30, until_done
             ax.axhline(0.5, color=MUTED, lw=0.8, ls=":")
         axes.flat[0].legend(loc="lower right", fontsize=7)
         fig.suptitle("MLP probe R² of each part from z_t (solid: live encoder, dashed: shadow)  ·  " + "  ".join(
-            f"{n}: {progress(out, [c]).iloc[0]['step']}/{c.steps}" for n, c in runs.items()), fontsize=9)
+            f"{n}: {_pr['step']}/{c.steps} {_pr['phase'] if isinstance(_pr.get('phase'), str) else ''}"
+            for n, c in runs.items() for _pr in [progress(out, [c]).iloc[0]]), fontsize=9)
         clear_output(wait=True)
         display(fig)
         plt.close(fig)

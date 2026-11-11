@@ -378,6 +378,33 @@ def test_variants_change_one_thing_each():
     assert v["position"][1].any() and not v["position"][1].all()  # some one-cell moves are blocked
 
 
+def test_finalize_rebuilds_the_summary_of_a_run_that_died_in_the_final_probes(tmp_path):
+    import json
+
+    from gaf import analysis as A
+    cfg = Cfg(arm="retain_open", env=SMALL, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, ret_every=4, lam=0.01, ckpt_every=5, eval_parts=128)
+    full = run(cfg, tmp_path, verbose=False)
+    for f in ("summary.json", "model.pt"):  # what a crash in the final probes leaves out
+        (tmp_path / cfg.run_id / f).unlink()
+    rebuilt = A.finalize(cfg, tmp_path)
+    assert set(rebuilt) == set(full) and {"pm_hand", "sh_pm_hand", "mlp_r2_slow", "sh_mlp_r2_slow"} <= set(rebuilt)
+    assert json.loads((tmp_path / cfg.run_id / "summary.json").read_text())["run_id"] == cfg.run_id
+    assert (tmp_path / cfg.run_id / "model.pt").exists()
+    assert A.finalize(cfg, tmp_path) == json.loads((tmp_path / cfg.run_id / "summary.json").read_text())  # second call: reads the file
+    assert len(A.collect(tmp_path)) == 1  # collect() accepts it
+
+
+def test_probes_sample_in_chunks_with_the_same_result():
+    from gaf.probes import collect_last, sample_chunked
+    env = GridEnv(GridCfg(W=8, H=6, n_slow=8, hand_p=0.5, hand_tiles=2), "cpu")
+    enc = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(3 * 32 * 32, 4))
+    z, y, vis = collect_last(enc, env, 300, chunk=128)
+    assert z.shape == (300, 4) and y.shape[0] == 300 and vis.shape == (300,)
+    c = sample_chunked(env, 300, chunk=128)
+    assert c.x.shape[0] == 300 and c.a.shape[0] == 300 and all(v.shape[0] == 300 for v in c.f.values())
+
+
 def test_visible_hand_probe():
     from gaf.probes import parts_probe
     env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.5), "cpu")

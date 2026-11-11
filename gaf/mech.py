@@ -27,7 +27,7 @@ from torch.func import functional_call, jvp
 from .env import GROUPS
 from .env_grid import N_MAT, TILE_CLASSES
 from .models import sigreg
-from .probes import encode, fit_ridge
+from .probes import collect_last, encode, fit_ridge
 
 REC_GROUPS = {"agent": range(6, 10), "mob": [5], "hand": range(20, 24), "inventory": range(10, 20), "twinkle": [4],
               "map": range(0, 4), "compass": range(24, 28)}
@@ -191,9 +191,7 @@ def _mlp_fit(z, y, hidden, steps, n_tr):
 def probe_size_curve(c, enc, tag: str, parts=("facing", "mob", "hand"), n_tr: int = 6000, n_te: int = 2000) -> dict:
     """The same parts read by a ridge, a small MLP and a large MLP: information that is present but hard to read gains with size."""
     env = c.env
-    with torch.no_grad():
-        clip = env.sample(n_tr + n_te)
-        z, y = encode(enc, clip.x[:, -1]), env.factors(clip)
+    z, y, _ = collect_last(enc, env, n_tr + n_te)
     mu, sd = z[:n_tr].mean(0), z[:n_tr].std(0).clamp_min(1e-6)
     z = (z - mu) / sd
     cols, P = env.group_cols(), env.parts()

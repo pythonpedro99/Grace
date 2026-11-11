@@ -406,6 +406,27 @@ def test_launch_skips_finished_and_running_runs(tmp_path, monkeypatch):
     assert A.launch([c], tmp_path) is None  # so an immediate second launch does not start it again
 
 
+def test_live_probes_stops_when_a_run_died(tmp_path, monkeypatch, capsys):
+    import json
+    import os
+    import time
+
+    import IPython.display as D
+    from gaf import analysis as A
+    monkeypatch.setattr(D, "display", lambda *a, **k: None)
+    monkeypatch.setattr(D, "clear_output", lambda *a, **k: None)
+    a, b = Cfg(arm="retain_open", seed=1, **TINY), Cfg(arm="retain_open", seed=2, **TINY)
+    for cfg, age in ((a, 3600), (b, 0)):  # a: progress file an hour old, no summary (died); b: finished
+        d = tmp_path / cfg.run_id
+        d.mkdir()
+        (d / "progress.json").write_text(json.dumps({"step": 7, "phase": "train"}))
+        os.utime(d / "progress.json", (time.time() - age,) * 2)
+    (tmp_path / b.run_id / "summary.json").write_text("{}")
+    t = time.time()
+    A.live_probes(tmp_path, {"dead": a, "done": b}, every=0.1, stale_minutes=30)  # must return, not wait for the dead run
+    assert time.time() - t < 20 and "killed or crashed" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(("arm", "rec"), [("retain", 1.0), ("retain_open", 1.0), ("retain", 0.0)])
 def test_retention_arms_run_and_log_the_reference(arm, rec, tmp_path):
     cfg = Cfg(arm=arm, shadow_rec=rec, ret_every=5, **TINY)
