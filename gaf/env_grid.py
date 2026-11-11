@@ -105,6 +105,7 @@ class GridEnv:
         assert c.agent_shape in ("marker", "arrow") and c.mob_mode in ("jump", "chase")
         assert c.mob_mode == "chase" or c.n_mobs == 1, "n_mobs is for the chase mode"
         self.cfg, self.dev = c, device
+        self.keep_state = False  # variants(): keep the sampled state of the last sample() call in self._state
         self.hide = set()  # components left out of the frame (component_masses): hand, compass, facing, agent, mob, twinkle, inventory
         gen = torch.Generator().manual_seed(c.seed)
         cells = torch.randperm(c.H * c.W, generator=gen)[:c.n_twinkle]
@@ -210,6 +211,9 @@ class GridEnv:
         vis = (torch.rand(n, device=dev) < c.hand_p if c.hand_p < 1
                else torch.ones(n, dtype=torch.bool, device=dev))
 
+        if self.keep_state:
+            self._state = dict(mat=mat, P=P, Fc=Fc, hand=hand, hud=hud, mob=mob, tw=tw, vis=vis)
+
         def xy(v):  # integer xy -> [-1, 1]
             return torch.stack([v[..., 0] / (c.W - 1), v[..., 1] / (c.H - 1)], -1) * 2 - 1
 
@@ -282,6 +286,37 @@ class GridEnv:
             x = torch.where((am & half)[..., None], face.to(dev),
                             torch.where(am[..., None], AGENT.to(dev), x))
         return (x * 2 - 1).permute(0, 1, 4, 2, 3).contiguous(), cflat
+
+    @torch.no_grad()
+    def variants(self, n: int) -> dict:
+        """Counterfactual last frames: the same sampled state with one thing changed. name -> (x (n, 3, res, res), valid (n,) bool),
+        for "base", "facing" (another direction, everything else as is), "position" (the agent one free cell away), "hand" (another
+        material in the hand tiles) and "twinkle" (fresh twinkle brightness). Used to ask an encoder how much its latent moves when
+        only that thing changes, without a probe."""
+        c, dev = self.cfg, self.dev
+        self.keep_state = True
+        try:
+            self.sample(n)
+        finally:
+            self.keep_state = False
+        st = {k: (v[:, -1:] if k in ("P", "Fc", "hand", "hud", "mob", "tw") else v) for k, v in self._state.items()}
+        ones = torch.ones(n, dtype=torch.bool, device=dev)
+
+        def draw(**over):
+            a = {**st, **over}
+            return self._render(a["mat"], a["P"], a["Fc"], a["hand"], a["hud"], a["mob"], a["tw"], a["vis"])[0][:, 0]
+
+        out = {"base": (draw(), ones)}
+        out["facing"] = (draw(Fc=(st["Fc"] + torch.randint(1, 4, (n, 1), device=dev)) % 4), ones)
+        out["hand"] = (draw(hand=(st["hand"] + torch.randint(1, N_MAT, (n, 1), device=dev)) % N_MAT), ones)
+        out["twinkle"] = (draw(tw=torch.rand_like(st["tw"])), ones)
+        q = st["P"] + DIRS.to(dev)[torch.randint(4, (n,), device=dev)][:, None]  # one cell in a random direction
+        inside = (q[..., 0] >= 0) & (q[..., 0] < c.W) & (q[..., 1] >= 0) & (q[..., 1] < c.H)
+        qc = torch.stack([q[..., 0].clamp(0, c.W - 1), q[..., 1].clamp(0, c.H - 1)], -1)
+        free = self._state["mat"][torch.arange(n, device=dev), qc[:, 0, 1], qc[:, 0, 0]] == EMPTY
+        on_mob = (st["mob"] == qc[:, :, None]).all(-1).any(-1)[:, 0]
+        out["position"] = (draw(P=qc), inside[:, 0] & free & ~on_mob)
+        return out
 
     def parts(self) -> dict:
         """Named parts of the groups: part -> (group, columns within the group)."""

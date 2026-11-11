@@ -342,6 +342,42 @@ def test_run_stops_itself_once_settled(tmp_path):
     assert s["steps_run"] == 30  # settle_window 0 (off by default) behaves the same
 
 
+@pytest.mark.parametrize("arm", ["retain_open", "ae"])
+def test_mechanism_diagnostics_are_logged(arm, tmp_path):
+    import numpy as np
+    import pandas as pd
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm=arm, env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, ret_every=4, lam=0.01, rec_class_power=1.0, log_mech=10, ckpt_every=5)
+    s = run(cfg, tmp_path, verbose=False)
+    h = pd.read_csv(tmp_path / cfg.run_id / "metrics.csv")
+    assert (tmp_path / cfg.run_id / "ckpt_5.pt").exists() and (tmp_path / cfg.run_id / "ckpt_10.pt").exists()
+    assert {"S_frac_slow", "S_n_hard"} <= set(h.columns)  # light: every eval
+    assert h["gnorm_pred"].isna().iloc[0] and h["gnorm_pred"].notna().iloc[1]  # heavy: every log_mech steps (here the last eval)
+    last = h.iloc[-1]
+    assert {"gnorm_pred", "gnorm_sigreg", "gcos_pred_sigreg", "sens_pred_facing", "sens_sigreg_hand", "pc_live_facing_lin",
+            "pc_live_hand_l", "lat_sens_facing_live", "lat_sens_position_live"} <= set(h.columns)
+    assert np.isfinite(last[["gnorm_pred", "gnorm_sigreg", "pc_live_facing_l"]].astype(float)).all()
+    d = np.load(tmp_path / cfg.run_id / "dirs.npz")
+    assert d["spec_live"].shape == (2, 8) and (d["spec_live"] >= -1e-6).all()
+    if arm == "retain_open":
+        assert {"gnorm_open", "gnorm_ret", "gcos_pred_ret", "ret_fit_slow", "sh_sigreg", "face_acc_sh", "rec_agent_sh",
+                "lat_sens_hand_sh", "pc_sh_mob_s", "sens_ret_hand"} <= set(h.columns)
+        assert 0 <= last["face_acc_sh"] <= 1 and np.isfinite(last["rec_agent_sh"])
+        assert {"refdir_w", "refdir_rho", "refdir_ac", "refdir_dom", "spec_shadow"} <= set(d.files)
+    else:
+        assert "gnorm_rec" in h.columns and 0 <= last["face_acc_live"] <= 1
+
+
+def test_variants_change_one_thing_each():
+    env = GridEnv(GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase"), "cpu")
+    v = env.variants(64)
+    base = v["base"][0]
+    assert set(v) == {"base", "facing", "hand", "position", "twinkle"} and all(x.shape == base.shape for x, _ in v.values())
+    assert all((x != base).flatten(1).any(1)[m].float().mean() > 0.95 for k, (x, m) in v.items() if k != "base")  # each valid variant differs
+    assert v["position"][1].any() and not v["position"][1].all()  # some one-cell moves are blocked
+
+
 def test_visible_hand_probe():
     from gaf.probes import parts_probe
     env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.5), "cpu")

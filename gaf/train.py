@@ -28,6 +28,7 @@ from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from hashlib import sha1
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -35,6 +36,7 @@ import torch
 from torch.func import functional_call, jvp
 from tqdm.auto import tqdm
 
+from . import mech
 from .env import GROUPS, ClipEnv, EnvCfg
 from .env_grid import GridCfg, GridEnv
 from .gate import FloorGate, floor_probe
@@ -140,6 +142,11 @@ class Cfg:
     # autocorrelation of ret_ac (full effect; 0: off) between consecutive frames keep a retention weight of at least ret_w_min
     ret_ac: float = 0.0
     ret_w_min: float = 0.3
+    # mechanism diagnostics (gaf/mech.py): >0 logs the cheap ones (spectra, gate share per group, per-direction reference arrays in dirs.npz,
+    # rewritten at every eval) at every eval and the heavy ones (gradient forces and attribution per loss term, retention fit, decoder and
+    # latent view of the facing, probe-size curve) every log_mech steps; ckpt_every > 0 saves the weights as ckpt_<step>.pt
+    log_mech: int = 0
+    ckpt_every: int = 0
     ret_floor_all: bool = False  # the unconditional floor: every direction keeps a retention weight of at least ret_w_min
     settle_window: int = 0
     settle_min_steps: int = 15_000
@@ -163,7 +170,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "settle_window": 0, "settle_min_steps": 15_000,
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
                 "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
@@ -351,6 +358,18 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     def tile_cls(clip):  # the class of every tile of the batch, for rec_error
         return assign_tiles(clip.x, centroids, cfg.env) if centroids is not None else clip.f.get("tile_class")
     acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
+    ctx = SimpleNamespace(
+        enc=enc, P=P, gate=gate, env=env, cfg=cfg, use_open=tgt_mode == "open",
+        shadow=shadow if use_ret else None, dec=dec if use_ret else None, ref=ref if use_ret else None,
+        Rh=Rh if use_ret else None, ae_dec=ae_dec if use_ae else None,
+        ae_rec=((lambda clip, zc, zt: rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, tile_cls(clip), cls_w,
+                                                cfg.env.tile if cls_w is not None else None)) if use_ae else None))
+
+    def save_dirs():
+        np.savez(odir / "dirs.npz", step=np.array([r["step"] for r in rows]),
+                 floor_step=np.array([s for s, _ in floors]),
+                 floor=np.stack([f.numpy() for _, f in floors]) if floors else np.zeros((0, D)),
+                 **{k: torch.stack(v).float().numpy() for k, v in dirs.items()})
     early, early_at = [], set(cfg.early_eval)
     calm, stopped_at = 0, None  # consecutive settled evals; the step at which the run stopped itself
     t0 = time.time()
@@ -540,6 +559,12 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                                       + 0.5 * (rho[signal][:, None] == rho[noisy][None]).mean())
                                 if noisy.any() and signal.any() else float("nan"))
                 m.update(ref.summary())
+            if cfg.log_mech and isinstance(cfg.env, GridCfg):
+                sh_c = c_sh if use_ret else None
+                m.update(mech.light(ctx, content, sh_c, dirs))
+                if (step + 1) % cfg.log_mech == 0 or step + 1 == cfg.steps:
+                    sd, st_ = mech.group_of(sh_c) if use_ret else (None, None)
+                    m.update(mech.heavy(ctx, sd, st_))
             if cfg.eval_parts and hasattr(env, "parts"):
                 kw = dict(n_train=cfg.eval_parts, n_test=2048, steps=cfg.eval_parts_steps)
                 m.update(parts_probe(enc, env, prefix="ev_", **kw))
@@ -562,6 +587,16 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             rows.append(row)
             if cfg.eval_parts:  # a run watched while it trains (analysis.live_probes) needs the curve on disk
                 pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
+            if cfg.log_mech:
+                save_dirs()
+            if cfg.ckpt_every and (step + 1) % cfg.ckpt_every == 0:
+                torch.save({"step": step + 1, "enc": enc.state_dict(), "P": P.state_dict(),
+                            **({"shadow": shadow.state_dict(), "dec": dec.state_dict() if dec else None, "Qs": Qs.state_dict(),
+                                "Rh": Rh.state_dict(),
+                                "ref": {k: getattr(ref, k).cpu() for k in ("mu", "W", "V", "M", "w", "rho", "gap", "err", "err_live", "ac")}}
+                               if use_ret else {}),
+                            **({"ae_dec": ae_dec.state_dict()} if use_ae else {}),
+                            "gate": {"Q": gate.Q.cpu(), "inS": gate.inS.cpu()}}, odir / f"ckpt_{step + 1}.pt")
             acc.clear()
             if verbose:
                 log(f"  [{cfg.arm} s{cfg.seed}] step {step + 1:>6}  loss {row['loss']:.4f}  "
@@ -591,10 +626,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
     if early:
         pd.DataFrame(early).to_csv(odir / "early.csv", index=False)
-    np.savez(odir / "dirs.npz", step=np.array([r["step"] for r in rows]),
-             floor_step=np.array([s for s, _ in floors]),
-             floor=np.stack([f.numpy() for _, f in floors]) if floors else np.zeros((0, D)),
-             **{k: torch.stack(v).float().numpy() for k, v in dirs.items()})
+    save_dirs()
     torch.save({"enc": enc.state_dict(), "P": P.state_dict(),
                 "enc_ema": enc_ema.state_dict() if enc_ema is not None else None,
                 **({"shadow": shadow.state_dict(), "dec": dec.state_dict() if dec else None}
