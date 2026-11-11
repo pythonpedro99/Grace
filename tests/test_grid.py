@@ -405,6 +405,33 @@ def test_probes_sample_in_chunks_with_the_same_result():
     assert c.x.shape[0] == 300 and c.a.shape[0] == 300 and all(v.shape[0] == 300 for v in c.f.values())
 
 
+@pytest.mark.parametrize("kw", [dict(arm="joint"), dict(arm="joint", pred_arch="film"), dict(arm="retain_open", pred_arch="film")])
+def test_joint_arm_film_predictor_and_decoder_readouts(kw, tmp_path):
+    from gaf import readout as R
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256, mlp_steps=5,
+              ret_every=4, lam=0.01, rec_class_power=1.0, ckpt_every=10, **kw)
+    s = run(cfg, tmp_path, verbose=False)
+    assert math.isfinite(s["pm_hand"])
+    d = tmp_path / cfg.run_id
+    dyn = R.dynamics(d, n_eval=64)
+    systems = {"live", "shadow"} if kw["arm"] == "retain_open" else {"live"}
+    assert set(dyn.index.get_level_values(0)) == systems
+    if kw["arm"] == "joint":  # the joint arm has its own decoder: the decoded predicted frame is scored
+        row = dyn.loc[("live", "predicted")]
+        assert 0 <= row["facing acc"] <= 1 and math.isfinite(row["agent"]) and math.isfinite(row["latent err / var"])
+    ds = R.decoder_strength(d, steps=3, n_eval=64)
+    assert set(ds.index) == systems and (ds["facing acc"].between(0, 1)).all()
+
+
+def test_film_predictor_starts_as_copy_last():
+    from gaf.models import FiLMPredictor, make_predictor
+    q = FiLMPredictor(8, 3, 5)
+    zc, a = torch.randn(4, 2, 8), torch.eye(5)[torch.randint(5, (4, 2))]
+    assert torch.allclose(q(zc, a), zc[:, -1])
+    assert isinstance(make_predictor("film", 8, 3, 5), FiLMPredictor)
+
+
 def test_visible_hand_probe():
     from gaf.probes import parts_probe
     env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.5), "cpu")

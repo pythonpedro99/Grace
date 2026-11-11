@@ -69,6 +69,37 @@ class Predictor(nn.Module):
         return self.net(torch.cat([zc.flatten(1), a.flatten(1)], 1))
 
 
+class FiLMPredictor(nn.Module):
+    """Residual predictor: z_t = z_{t-1} + f(context), where the last action scales and shifts every hidden layer (a multiplicative path
+    for "action x where the agent is") and the earlier actions are inputs. Starts as "copy the last frame" (zero output layer). In a
+    3000-step fork on a frozen shadow it learned the facing faster than the plain MLP (decoded move-step accuracy 0.46 vs 0.27)."""
+
+    def __init__(self, D: int, T: int = 3, act_dim: int = ACT_DIM, hidden: int = 512, layers: int = 3):
+        super().__init__()
+        self.inp = nn.Linear((T - 1) * D + (T - 2) * act_dim, hidden)
+        self.hid = nn.ModuleList(nn.Linear(hidden, hidden) for _ in range(layers - 1))
+        self.film = nn.Linear(act_dim, 2 * hidden * layers)
+        self.out = nn.Linear(hidden, D)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+        self.layers, self.hidden = layers, hidden
+
+    def forward(self, zc, a):
+        g = self.film(a[:, -1]).view(-1, self.layers, 2, self.hidden)
+        h = self.inp(torch.cat([zc.flatten(1), a[:, :-1].flatten(1)], 1))
+        for i in range(self.layers):
+            h = nn.functional.gelu(h * (1 + g[:, i, 0]) + g[:, i, 1])
+            if i < self.layers - 1:
+                h = self.hid[i](h)
+        return zc[:, -1] + self.out(h)
+
+
+def make_predictor(arch: str, D: int, T: int, act_dim: int) -> nn.Module:
+    """"mlp": the plain MLP on [context latents, actions]; "film": the residual, action-gated FiLMPredictor."""
+    assert arch in ("mlp", "film"), f"unknown predictor {arch}"
+    return Predictor(D, T, act_dim) if arch == "mlp" else FiLMPredictor(D, T, act_dim)
+
+
 @torch.no_grad()
 def ema_(target: nn.Module, source: nn.Module, tau: float) -> None:
     for t, s in zip(target.parameters(), source.parameters(), strict=True):

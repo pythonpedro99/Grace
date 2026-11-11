@@ -41,7 +41,7 @@ from .env import GROUPS, ClipEnv, EnvCfg
 from .env_grid import GridCfg, GridEnv
 from .gate import FloorGate, floor_probe
 from .grads import SplitAdamW, vjp
-from .models import Decoder, Encoder, Predictor, ema_, frozen_copy, sigreg
+from .models import Decoder, Encoder, Predictor, ema_, frozen_copy, make_predictor, sigreg
 from .probes import mlp_probe, parts_probe, probe_suite, r2
 from .retain import RefMap
 
@@ -57,9 +57,10 @@ ARMS = {  # arm: (context path, target path)
     "retain": ("raw", "none"),  # sg + reference-gated retention
     "retain_open": ("raw", "open"),  # + the floor-gated open target path (noise removal)
     "ae": ("none", "none"),  # an autoencoder: reconstruction + SIGReg, no prediction loss (B's shadow encoder on its own)
+    "joint": ("raw", "none"),  # one encoder: reconstruction (keeps the content) + prediction through the context path (shapes it) + SIGReg
 }
 RETAIN_ARMS = ("retain", "retain_open")
-AE_ARMS = ("ae",)
+AE_ARMS = ("ae", "joint")
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,7 @@ class Cfg:
     # latent view of the facing, probe-size curve) every log_mech steps; ckpt_every > 0 saves the weights as ckpt_<step>.pt
     log_mech: int = 0
     ckpt_every: int = 0
+    pred_arch: str = "mlp"  # predictor (and the shadow's): "mlp" or "film" (models.FiLMPredictor: residual, action-gated)
     ret_floor_all: bool = False  # the unconditional floor: every direction keeps a retention weight of at least ret_w_min
     settle_window: int = 0
     settle_min_steps: int = 15_000
@@ -170,7 +172,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
                 "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
@@ -318,7 +320,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
     T, D, N = cfg.env.T, cfg.D, cfg.batch
     ctx_mode, tgt_mode = ARMS[cfg.arm]
 
-    enc, P = Encoder(D, cfg.env.res).to(dev), Predictor(D, T, env.act_dim).to(dev)
+    enc, P = Encoder(D, cfg.env.res).to(dev), make_predictor(cfg.pred_arch, D, T, env.act_dim).to(dev)
     P_lag = frozen_copy(P)
     enc_ema = frozen_copy(enc) if tgt_mode == "ema" else None
     tgt_enc = enc_ema or enc
@@ -332,7 +334,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                      cfg.floor_keep, cfg.floor_margin, cfg.soft)
     use_ret = cfg.arm in RETAIN_ARMS
     if use_ret:  # shadow encoder (+ decoder), shadow predictor, retention head, reference map
-        shadow, Qs = Encoder(D, cfg.env.res).to(dev), Predictor(D, T, env.act_dim).to(dev)
+        shadow, Qs = Encoder(D, cfg.env.res).to(dev), make_predictor(cfg.pred_arch, D, T, env.act_dim).to(dev)
         Qs_lag = frozen_copy(Qs)
         dec = (Decoder(D * (2 if cfg.rec_diff else 1), cfg.env.res).to(dev)
                if cfg.shadow_rec > 0 else None)
@@ -643,7 +645,7 @@ def load_model(cfg: Cfg, out):
     dev = device()
     sd = torch.load(Path(out) / cfg.run_id / "model.pt", map_location=dev)
     act_dim = make_env(cfg.env, "cpu").act_dim
-    enc, P = Encoder(cfg.D, cfg.env.res).to(dev), Predictor(cfg.D, cfg.env.T, act_dim).to(dev)
+    enc, P = Encoder(cfg.D, cfg.env.res).to(dev), make_predictor(cfg.pred_arch, cfg.D, cfg.env.T, act_dim).to(dev)
     enc.load_state_dict(sd["enc"])
     P.load_state_dict(sd["P"])
     tgt = enc

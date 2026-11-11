@@ -106,6 +106,7 @@ projected).
 | `retain` | `g_ctx` + retention | none | experimental, unsupervised: reference-gated retention alone (`docs/reference_gated_retention.md`) |
 | `retain_open` | `g_ctx` + retention | `g_open` | the same plus the floor-gated open path that removes noise |
 | `ae` | none | none | an autoencoder: reconstruction (`shadow_rec`) + SIGReg, no prediction loss; B's shadow encoder on its own |
+| `joint` | `g_ctx` | none | one encoder with reconstruction (keeps the content) + prediction (shapes it for dynamics) + SIGReg (`grid_joint.ipynb`) |
 
 Every arm runs the same optimizer, gate and diagnostics, so the leak can be compared across arms.
 
@@ -234,12 +235,18 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
     gaf/probes.py    ridge / MLP probes, probing suite
     gaf/train.py     Cfg, ARMS, make_env(), run(), run_gt() (learnability on ground truth), premise(),
                      capacity() (which D the content needs)
-    gaf/analysis.py  grids, collect, tables, verdicts, floors_of(), parts_r2(), figures
+    gaf/analysis.py  grids, collect, tables, verdicts, floors_of(), parts_r2(), figures, launch()/live_probes() (background runs), finalize()
+    gaf/mech.py      mechanism diagnostics (Cfg.log_mech): per-term gradient forces and attribution, retention weights, spectra
+    gaf/readout.py   decoder-based readouts of a checkpoint: dynamics() (decoded predicted frames), decoder_strength()
     tests/           CPU checks
     gain_attribution.ipynb   the clip world
     grid_benchmark.ipynb     the grid world (results in /workspace/results_grid)
     sigreg_hypothesis.ipynb  does SIGReg select content by pixel mass? (clip world, and the SIGReg weight in the grid world)
     grid_mass_law.ipynb      the mass law in the grid world (results in /workspace/results_masslaw)
+    grid_b_d128.ipynb        B at D = 128 with the arrow agent and chasing mob (results in /workspace/results_b128)
+    grid_b_mechanism.ipynb   what removes the hand, holds the noise, collapses the rank (results in /workspace/results_mech)
+    grid_joint.ipynb         one encoder with reconstruction + prediction (results in /workspace/results_joint)
+    docs/findings.md         everything learned so far, with the numbers, the corrections and the open questions
 
 ## Cost
 
