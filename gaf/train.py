@@ -148,6 +148,7 @@ class Cfg:
     # latent view of the facing, probe-size curve) every log_mech steps; ckpt_every > 0 saves the weights as ckpt_<step>.pt
     log_mech: int = 0
     ckpt_every: int = 0
+    rec_class_cap: float = 30.0  # class weights are clamped to [1/cap, cap] before normalising: a smaller cap keeps terrain and mob from being zeroed
     pred_arch: str = "mlp"  # predictor (and the shadow's): "mlp" or "film" (models.FiLMPredictor: residual, action-gated)
     ret_floor_all: bool = False  # the unconditional floor: every direction keeps a retention weight of at least ret_w_min
     settle_window: int = 0
@@ -172,7 +173,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "rec_class_cap": 30.0, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
                 "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
@@ -355,7 +356,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             centroids, cls_w, _ = cluster_classes(env, cfg.rec_clusters, cfg.rec_class_power, seed=cfg.seed,
                                                   k_pos=cfg.rec_pos_types)
         else:
-            cls_w, _ = class_weights(env, cfg.rec_class_power)
+            cls_w, _ = class_weights(env, cfg.rec_class_power, cap=cfg.rec_class_cap)
 
     def tile_cls(clip):  # the class of every tile of the batch, for rec_error
         return assign_tiles(clip.x, centroids, cfg.env) if centroids is not None else clip.f.get("tile_class")

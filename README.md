@@ -238,6 +238,7 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
     gaf/analysis.py  grids, collect, tables, verdicts, floors_of(), parts_r2(), figures, launch()/live_probes() (background runs), finalize()
     gaf/mech.py      mechanism diagnostics (Cfg.log_mech): per-term gradient forces and attribution, retention weights, spectra
     gaf/readout.py   decoder-based readouts of a checkpoint: dynamics() (decoded predicted frames), decoder_strength()
+    gaf/fork.py      forks of a finished joint run: continue / fade / anchor (prediction distillation) / freeze, from its checkpoint
     tests/           CPU checks
     gain_attribution.ipynb   the clip world
     grid_benchmark.ipynb     the grid world (results in /workspace/results_grid)
@@ -245,7 +246,7 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
     grid_mass_law.ipynb      the mass law in the grid world (results in /workspace/results_masslaw)
     grid_b_d128.ipynb        B at D = 128 with the arrow agent and chasing mob (results in /workspace/results_b128)
     grid_b_mechanism.ipynb   what removes the hand, holds the noise, collapses the rank (results in /workspace/results_mech)
-    grid_joint.ipynb         one encoder with reconstruction + prediction (results in /workspace/results_joint)
+    grid_joint.ipynb         the joint model: warmup (reconstruction + prediction), fade, prediction-distillation anchor (results in /workspace/results_joint)
     docs/findings.md         everything learned so far, with the numbers, the corrections and the open questions
 
 ## Cost

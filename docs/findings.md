@@ -228,7 +228,9 @@ latent predictable**. B joins them only by a linear readout, so neither latent h
 
 ## 11. Open questions, in order
 
-1. **The joint arm** against B and against the shadow alone: content and predicted frames, both decoded.
+1. **The joint arm** against the shadow alone (content and predicted frames, both decoded), then the fade and the prediction-distillation
+   anchor as forks of its checkpoint (`grid_joint.ipynb`, `gaf/fork.py`; ground-truth class weights with a softer cap of 4 so terrain and mob
+   are not zeroed). Not run yet.
 2. **Terrain and mob in the latent:** an unweighted decoder readout, and a softer class-weight cap.
 3. **An independence-based noise criterion** against the current release rule.
 4. **Seeds.** Above all the floor-and-open-path interaction and the joint arm.

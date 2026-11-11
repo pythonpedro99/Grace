@@ -424,6 +424,37 @@ def test_joint_arm_film_predictor_and_decoder_readouts(kw, tmp_path):
     assert set(ds.index) == systems and (ds["facing acc"].between(0, 1)).all()
 
 
+def test_joint_forks_fade_anchor_freeze_and_readout(tmp_path):
+    import pandas as pd
+
+    from gaf import fork as F
+    from gaf import readout as R
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, lam=0.01, rec_class_power=1.0, rec_class_cap=4.0, ckpt_every=10)
+    run(cfg, tmp_path, verbose=False)
+    d = tmp_path / cfg.run_id
+    snapshots = {}
+    for mode in F.MODES:
+        out = F.joint_fork(d, mode, steps=20, fade=10, r_floor=0.1, beta=5.0, log_every=10, verbose=False)
+        m = pd.read_csv(out / "metrics.csv")
+        snapshots[mode] = m
+        assert (out / "done").exists() and (out / f"ckpt_{cfg.steps}.pt").exists() and len(m) == 2
+    assert snapshots["continue"]["r"].eq(1.0).all() and snapshots["freeze"]["r"].eq(1.0).all()  # no fade there
+    assert abs(snapshots["fade"]["r"].iloc[-1] - 0.1) < 1e-6 and abs(snapshots["anchor"]["beta"].iloc[-1] - 5.0) < 1e-6
+    assert "anchor" in snapshots["anchor"] and "anchor" not in snapshots["fade"] and "rec" not in snapshots["freeze"]
+    st = F.status(d)
+    assert (st.state == "done").all()
+    dyn = R.dynamics(d / "forks" / "anchor", n_eval=64)  # a fork reads like a run
+    assert ("live", "predicted") in dyn.index and 0 <= dyn.loc[("live", "predicted"), "facing acc"] <= 1
+    # the cap: a smaller cap keeps terrain's weight from being pushed to the floor
+    from gaf.train import class_weights
+    torch.manual_seed(0)
+    w30, _ = class_weights(GridEnv(env, "cpu"), 1.0, n=256, cap=30.0)
+    w4, _ = class_weights(GridEnv(env, "cpu"), 1.0, n=256, cap=4.0)
+    assert w4[TC["map:floor"]] > 3 * w30[TC["map:floor"]]
+
+
 def test_film_predictor_starts_as_copy_last():
     from gaf.models import FiLMPredictor, make_predictor
     q = FiLMPredictor(8, 3, 5)
