@@ -315,6 +315,30 @@ def test_eval_time_part_probes_are_logged_and_curve_is_written_while_running(tmp
     assert seen and seen[0] >= 1 and "pm_hand" in s
 
 
+def test_is_settled_follows_change_and_swing_of_the_part_probes():
+    from gaf.train import is_settled
+    flat = [{"step": 1000 * i, "ev_pm_hand": 0.9 + 0.01 * (i % 2), "ev_sh_pm_hand": 0.8, "ev_pm_rank": 5 * i} for i in range(1, 12)]
+    assert is_settled(flat, 4000, 8000)  # moves by 0.01: settled
+    assert not is_settled(flat, 4000, 20_000)  # not enough steps yet
+    assert not is_settled(flat[:3], 4000, 1000)  # no eval a window back
+    rising = [{**r, "ev_pm_hand": 0.05 * i} for i, r in enumerate(flat)]
+    assert not is_settled(rising, 4000, 8000)  # +0.2 over the window
+    swing = [{**r, "ev_sh_pm_hand": 0.8 + (0.15 if i % 2 else 0)} for i, r in enumerate(flat)]
+    assert not is_settled(swing, 4000, 8000)  # up and down by 0.15: ends where it started but swings
+
+
+def test_run_stops_itself_once_settled(tmp_path):
+    import pandas as pd
+    base = dict(arm="retain_open", env=SMALL, D=8, steps=30, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128,
+                mlp_n=256, mlp_steps=5, ret_every=4, lam=0.01, eval_parts=128)
+    s = run(Cfg(**base, settle_window=10, settle_min_steps=10, settle_patience=2, settle_tol_change=9, settle_tol_swing=9),
+            tmp_path / "a", verbose=False)
+    assert s["steps_run"] == 20 and len(pd.read_csv(tmp_path / "a" / s["run_id"] / "metrics.csv")) == 4  # evals at 5, 10, 15, 20
+    assert math.isfinite(s["pm_hand"]) and math.isfinite(s["sh_pm_hand"])  # the final probes still ran
+    s = run(Cfg(**base, settle_window=10, settle_min_steps=10, settle_tol_change=-1), tmp_path / "b", verbose=False)  # never settled
+    assert s["steps_run"] == 30  # settle_window 0 (off by default) behaves the same
+
+
 def test_visible_hand_probe():
     from gaf.probes import parts_probe
     env = GridEnv(GridCfg(W=12, H=8, hand_tiles=2, hand_p=0.5), "cpu")

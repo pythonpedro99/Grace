@@ -133,6 +133,14 @@ class Cfg:
     # trained on this many clips (0: off); logged as ev_pm_<part>, ev_sh_pm_<part>. metrics.csv is then rewritten at every eval.
     eval_parts: int = 0
     eval_parts_steps: int = 400  # training steps of that probe (the final probe uses 2 * mlp_steps on mlp_n clips: stronger)
+    # early stopping once settled (needs eval_parts; `steps` is then only the cap): at an eval, every ev_pm_* / ev_sh_pm_* readout changed
+    # by less than settle_tol_change between the eval `settle_window` steps back and now and swung by less than settle_tol_swing inside
+    # that window, at settle_patience evals in a row, and at least settle_min_steps are done. 0: off.
+    settle_window: int = 0
+    settle_min_steps: int = 15_000
+    settle_patience: int = 2
+    settle_tol_change: float = 0.05
+    settle_tol_swing: float = 0.1
 
     @property
     def run_id(self) -> str:
@@ -150,7 +158,8 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400}
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "settle_window": 0, "settle_min_steps": 15_000,
+                "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
 
@@ -251,6 +260,22 @@ def assign_tiles(x, cl, c):
     return a + k * ptype
 
 
+def is_settled(rows, window, min_steps, tol_change=0.05, tol_swing=0.1) -> bool:
+    """Whether the per-part probe curves (ev_pm_*, ev_sh_pm_* of the eval rows) have stopped moving: over the last `window` steps every
+    readout changed by < tol_change and swung (max - min) by < tol_swing. Same rule as analysis.drift, on the eval-time probes."""
+    last = rows[-1]["step"]
+    keys = [k for k in rows[-1] if k.startswith(("ev_pm_", "ev_sh_pm_")) and not k.endswith(("rank", "visible"))]
+    base = [r for r in rows if r["step"] <= last - window]
+    if last < min_steps or not keys or not base:
+        return False
+    inside = [r for r in rows if r["step"] >= base[-1]["step"]]
+    for k in keys:
+        v = [r[k] for r in inside]
+        if not np.isfinite(v).all() or abs(v[-1] - v[0]) >= tol_change or max(v) - min(v) >= tol_swing:
+            return False
+    return True
+
+
 def rec_error(x_hat, x, cls=None, w=None, tile=None):
     """Mean squared reconstruction error per pixel and channel; with class weights w (per tile class), each tile's error is
     weighted by w[its class]. x, x_hat: (..., 3, res, res); cls: (..., tiles) with tiles = (res / tile)^2."""
@@ -321,6 +346,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         return assign_tiles(clip.x, centroids, cfg.env) if centroids is not None else clip.f.get("tile_class")
     acc, rows, dirs, floors, probe = defaultdict(list), [], defaultdict(list), [], None
     early, early_at = [], set(cfg.early_eval)
+    calm, stopped_at = 0, None  # consecutive settled evals; the step at which the run stopped itself
     t0 = time.time()
 
     for step in range(cfg.steps):
@@ -534,10 +560,17 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                       f"|S| {row['n_S']:>2}/{D}  " + "  ".join(
                           f"{g} {row[f'r2_{g}']:.2f}" for g in GROUPS)
                       + f"  ({time.time() - t0:.0f}s)")
+            if cfg.settle_window:
+                calm = calm + 1 if is_settled(rows, cfg.settle_window, cfg.settle_min_steps, cfg.settle_tol_change,
+                                              cfg.settle_tol_swing) else 0
+                if calm >= cfg.settle_patience and step + 1 < cfg.steps:
+                    stopped_at = step + 1
+                    log(f"  [{cfg.arm} s{cfg.seed}] settled at step {stopped_at}: stopping (cap {cfg.steps})")
+                    break
 
     if on_step:
         on_step(cfg.steps, "final probes")
-    summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": time.time() - t0,
+    summary = {"run_id": cfg.run_id, "cfg": asdict(cfg), "seconds": time.time() - t0, "steps_run": stopped_at or cfg.steps,
                "final": rows[-1], **mlp_probe(enc, env, cfg.mlp_n, cfg.probe_n, cfg.mlp_steps)}
     if hasattr(env, "parts"):  # standardised MLP per named part, and the effective rank (grid world)
         kw = dict(n_train=cfg.mlp_n, n_test=cfg.probe_n, steps=2 * cfg.mlp_steps)

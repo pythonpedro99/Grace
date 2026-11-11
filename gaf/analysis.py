@@ -149,7 +149,8 @@ def progress(out, cfgs) -> pd.DataFrame:
     for c in cfgs:
         d = Path(out) / c.run_id
         if (d / "summary.json").exists():
-            rows[_label(c)] = {"state": "done", "step": c.steps, "of": c.steps}
+            sr = json.loads((d / "summary.json").read_text()).get("steps_run", c.steps)
+            rows[_label(c)] = {"state": "done" if sr == c.steps else "done (settled early)", "step": sr, "of": c.steps}
             continue
         try:
             pr = json.loads((d / "progress.json").read_text())
