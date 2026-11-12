@@ -189,6 +189,28 @@ shaped for dynamics.** The hand's dynamics need the terrain next to the agent, w
   latents SIGReg is *more* robust than VICReg ("SIGReg's Gaussianization of h is more robust to non-Gaussian latent variable distributions than
   whitening").
 
+## 8b. The joint model (`grid_joint.ipynb`; ground-truth class weights with cap 4, FiLM predictor, D = 128, 20k warmup, seed 0)
+
+- **The softer cap fixed availability.** The shadow alone (`ae`) now holds mob 0.98, terrain 0.98 and twinkle 0.97 (own decoder; fresh decoder
+  mob 0.78, terrain 0.83), against mob 0.07 and terrain −0.05 with cap 30. The earlier "the mob is never learned" was the weights.
+- **Joint against the shadow alone**, same predictor and weights: predicted move-step facing 0.71 against 0.62, agent 0.77 against 0.74, which missed
+  the pre-registered thresholds (+0.15 / +0.10). The joint model **predicts the hand** (0.37 against copy-last −0.26; the shadow alone 0.00; no predictor
+  before got above −0.07). The joint model holds hand 0.98, agent 0.81, facing 0.83 (fresh decoder) and loses part of the mob (own decoder 0.52).
+- **More joint training keeps improving the predictions** (20k more steps: agent 0.78 → 0.92, hand 0.29 → 0.40, facing on move steps 0.73 → 0.88,
+  mob predicted 0.18 → 0.32 against copy-last 0.15, mob content 0.53 → 0.83). It has not plateaued.
+- **Fade (reconstruction 1 → 0.1) erodes**: facing 0.89 → 0.53 (fresh decoder; own decoder 0.98 → 0.83), agent, mob, terrain. **The prediction-distillation anchor**
+  (a frozen snapshot, weight 10) holds all content but **stalls the learning**: its predictions stay at the parent's level while `continue` gains 0.11–0.15.
+  Noise release was ambiguous (twinkle 0.31 → 0.01 by the fresh decoder, 0.88 → 0.78 by the own decoder). So no measured benefit of fade + anchor over
+  continuing.
+- **The joint latent is dominated by slow content** (copy-last error over variance 0.01 against 0.52 for the shadow), so latent MSE is no longer a progress measure.
+- **Instrument caveat:** a fresh decoder of 3000 steps under-reads entangled content (mob, twinkle, facing) relative to the model's own decoder.
+
+**The leaves.** The joint arm does not remove the unpredictable content (twinkle held at 0.83–0.93 by the own decoder, predicted −1.1). Hypothesis: the decoder is a
+consumer with free gain, so the encoder keeps the noise at low amplitude, where it costs almost nothing in the prediction loss. Tested in `grid_joint_dp.ipynb`
+with a **decoded-prediction term** (`Cfg.dp_weight`: `||D(P(z_ctx, a)) − x_next||`, class-weighted), as the only reconstruction-like term (idea 2) or kept while the
+content-agnostic reconstruction is faded (idea 3, `gaf/fork.py`), read by decoders, the latent's variance shares (`readout.variance_shares`) and a timeline
+over the checkpoints. Not run yet.
+
 ## 9. Revised beliefs
 
 | earlier | now |
@@ -228,9 +250,8 @@ latent predictable**. B joins them only by a linear readout, so neither latent h
 
 ## 11. Open questions, in order
 
-1. **The joint arm** against the shadow alone (content and predicted frames, both decoded), then the fade and the prediction-distillation
-   anchor as forks of its checkpoint (`grid_joint.ipynb`, `gaf/fork.py`; ground-truth class weights with a softer cap of 4 so terrain and mob
-   are not zeroed). Not run yet.
+1. **The leaves in the joint model** (`grid_joint_dp.ipynb`): the decoded-prediction term alone (idea 2) and as the consolidation of a faded reconstruction
+   (idea 3), with pre-registered expectations. The joint arm itself is run (section 8b).
 2. **Terrain and mob in the latent:** an unweighted decoder readout, and a softer class-weight cap.
 3. **An independence-based noise criterion** against the current release rule.
 4. **Seeds.** Above all the floor-and-open-path interaction and the joint arm.

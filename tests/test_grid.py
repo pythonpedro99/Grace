@@ -455,6 +455,40 @@ def test_joint_forks_fade_anchor_freeze_and_readout(tmp_path):
     assert w4[TC["map:floor"]] > 3 * w30[TC["map:floor"]]
 
 
+@pytest.mark.parametrize("kw", [dict(dp_weight=1.0), dict(dp_weight=1.0, shadow_rec=0.0)])
+def test_decoded_prediction_term_trains_and_forks_keep_it(kw, tmp_path):
+    import pandas as pd
+
+    from gaf import fork as F
+    from gaf import readout as R
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, lam=0.01, rec_class_power=1.0, rec_class_cap=4.0, pred_arch="film", ckpt_every=5, **kw)
+    s = run(cfg, tmp_path, verbose=False)
+    h = pd.read_csv(tmp_path / cfg.run_id / "metrics.csv")
+    assert "dp" in h.columns and h["dp"].notna().all() and h["dp"].iloc[-1] > 0  # the decoded-prediction term is logged
+    d = tmp_path / cfg.run_id
+    out = F.joint_fork(d, "fade", steps=10, fade=5, r_floor=0.0, tag="r0", log_every=5, verbose=False)
+    assert out.name == "fade-r0" and "dp" in pd.read_csv(out / "metrics.csv").columns  # the fork keeps the decoded prediction, the fade only the rest
+    assert (F.status(d, modes=["fade-r0"]).state == "done").all()
+    # every readout reads an earlier checkpoint and the latent's variance shares
+    assert ("live", "predicted") in R.dynamics(d, n_eval=64, step=5).index
+    vs = R.variance_shares(d, n=256, step=5)
+    assert set(vs) == {"inventory", "position", "facing", "hand", "mob", "twinkle"} and all(0 <= v <= 1.0001 for v in vs.values())
+    assert math.isfinite(R.probes(d, n_train=256, n_test=64, steps=5)["pm_hand"])
+
+
+def test_dp_weight_zero_leaves_the_joint_run_unchanged(tmp_path):
+    """dp_weight is a late field: default runs keep their ids and have no dp column."""
+    import pandas as pd
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    base = dict(arm="joint", env=env, D=8, steps=5, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=64, mlp_n=128,
+                mlp_steps=3, lam=0.01)
+    assert Cfg(**base).run_id == Cfg(**base, dp_weight=0.0).run_id != Cfg(**base, dp_weight=1.0).run_id
+    run(Cfg(**base), tmp_path, verbose=False)
+    assert "dp" not in pd.read_csv(tmp_path / Cfg(**base).run_id / "metrics.csv").columns
+
+
 def test_film_predictor_starts_as_copy_last():
     from gaf.models import FiLMPredictor, make_predictor
     q = FiLMPredictor(8, 3, 5)

@@ -6,7 +6,7 @@ time (docs/findings.md). These readouts decode instead of probing. Each score pe
 orientation of the decoded agent tile matched to the four arrow silhouettes (chance 0.25); "move steps" are the clips whose last action
 moved or turned the agent, where copying the last frame is mostly wrong.
 
-    load(run_dir)             the checkpoint at the run's last step: cfg, env and the networks
+    load(run_dir, step)       the checkpoint at `step` (default: the run's last): cfg, env and the networks (every readout takes `step`)
     dynamics(run_dir)         per system (live: encoder + predictor + its decoder; shadow: shadow + Qs + dec), the decoded next frame from
                               the real latent (ceiling), from the predictor (what the model foresees) and from the last frame (floor)
     decoder_strength(run_dir) a fresh class-weighted decoder trained on each frozen latent: what the latent holds, at decoder strength
@@ -84,10 +84,10 @@ def _scorer(ck, ev):
 
 
 @torch.no_grad()
-def dynamics(run_dir, n_eval: int = 2048) -> pd.DataFrame:
+def dynamics(run_dir, n_eval: int = 2048, step=None) -> pd.DataFrame:
     """For every system with a decoder of its own: the decoded next frame from the real latent, the predictor's output and the last
     frame, plus the latent prediction error over the latent's variance. Rows (system, version)."""
-    ck = load(run_dir)
+    ck = load(run_dir, step)
     ev = ck.env.sample(n_eval)
     score, rows = _scorer(ck, ev), {}
     for name, (E, Pr, dec) in systems(ck).items():
@@ -99,10 +99,10 @@ def dynamics(run_dir, n_eval: int = 2048) -> pd.DataFrame:
     return pd.DataFrame(rows).T
 
 
-def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int = 256) -> pd.DataFrame:
+def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int = 256, step=None) -> pd.DataFrame:
     """Freeze each encoder of the checkpoint, train a fresh decoder (class-weighted pixel loss, as the shadow) on its latent and decode
     held-out frames. Note: the class weights down-weight terrain and mob, so this under-reads those two."""
-    ck = load(run_dir)
+    ck = load(run_dir, step)
     w, _ = class_weights(ck.env, 1.0)
     ev = ck.env.sample(n_eval)
     score, rows = _scorer(ck, ev), {}
@@ -122,3 +122,29 @@ def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int 
         with torch.no_grad():
             rows[name] = score(dec(E(ev.x[:, -1])))
     return pd.DataFrame(rows).T
+
+
+@torch.no_grad()
+def variance_shares(run_dir, n: int = 4096, step=None) -> dict:
+    """The share of the live latent's total variance that a linear function of each part's true factors explains (a lower bound: nonlinear
+    dependence is missed). Small = that content sits in the latent at low amplitude (invisible to the prediction loss and to distances)."""
+    from .probes import fit_ridge
+    ck = load(run_dir, step)
+    env, E = ck.env, systems(ck)["live"][0]
+    clip = env.sample(n)
+    z, y = E(clip.x[:, -1]), env.factors(clip)
+    tot = (z - z.mean(0)).pow(2).sum()
+    cols, out = env.group_cols(), {}
+    for part, (g, s) in env.parts().items():
+        yp = y[:, cols[g].start + s.start: cols[g].start + s.stop]
+        W, b = fit_ridge(yp, z)
+        zh = yp @ W + b
+        out[part] = ((zh - zh.mean(0)).pow(2).sum() / tot).item()
+    return out
+
+
+def probes(run_dir, n_train: int = 8000, n_test: int = 2048, steps: int = 800, step=None) -> dict:
+    """MLP probe of every named part from the live latent (the final-probe style; a lower bound for content, see the decoder readouts)."""
+    from .probes import parts_probe
+    ck = load(run_dir, step)
+    return parts_probe(systems(ck)["live"][0], ck.env, n_train=n_train, n_test=n_test, steps=steps)

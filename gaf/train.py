@@ -148,6 +148,11 @@ class Cfg:
     # latent view of the facing, probe-size curve) every log_mech steps; ckpt_every > 0 saves the weights as ckpt_<step>.pt
     log_mech: int = 0
     ckpt_every: int = 0
+    # decoded prediction (arms joint, ae; grid world): the predictor's output is decoded and compared with the REAL next frame, with the same
+    # class-weighted pixel error as the reconstruction: ||D(P(z_ctx, a)) - x_next||. A prediction cannot contain unpredictable content (leaves),
+    # so this term asks for nothing but what can be predicted. With shadow_rec = 0 it is the only reconstruction-like term (reconstruct only
+    # what can be predicted); with shadow_rec > 0 it adds to the content-agnostic reconstruction, which can then be faded (fork.py) while this stays.
+    dp_weight: float = 0.0
     rec_class_cap: float = 30.0  # class weights are clamped to [1/cap, cap] before normalising: a smaller cap keeps terrain and mob from being zeroed
     pred_arch: str = "mlp"  # predictor (and the shadow's): "mlp" or "film" (models.FiLMPredictor: residual, action-gated)
     ret_floor_all: bool = False  # the unconditional floor: every direction keeps a retention weight of at least ret_w_min
@@ -173,7 +178,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "rec_class_cap": 30.0, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "rec_class_cap": 30.0, "dp_weight": 0.0, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
                 "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
@@ -408,6 +413,10 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             zt_d = zt.detach()
         p = P(zc.detach() if ctx_m == "none" else zc, a)
         L = (p - zt_d).pow(2).mean()  # (1/D) sum_j L_j: LeWM's MSE scale
+        dp = None
+        if use_ae and cfg.dp_weight > 0:  # the predictor's output decoded against the real next frame
+            dp = rec_error(ae_dec(p), xt, tile_cls(clip)[:, -1], cls_w, cfg.env.tile if cls_w is not None else None)
+            acc["dp"].append(dp.item())
         with torch.no_grad():
             gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach(), a) - zt_d))
         sig_raw = sigreg(torch.cat([zc.transpose(0, 1), zt[None]]), cfg.n_slices)
@@ -420,7 +429,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             rec = rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, tile_cls(clip), cls_w, cfg.env.tile
                             if cls_w is not None else None)
             enc_aux = enc_aux + cfg.shadow_rec * rec
-            gD = torch.autograd.grad(cfg.shadow_rec * rec, list(ae_dec.parameters()), retain_graph=True)
+            gD = torch.autograd.grad(cfg.shadow_rec * rec + (cfg.dp_weight * dp if dp is not None else 0.0), list(ae_dec.parameters()),
+                                     retain_graph=True)
             acc["ae_rec_mse"].append(rec.item())
         if use_ret:
             # shadow: SIGReg (+ reconstruction) only, so it keeps content; Qs gives the floor
@@ -458,7 +468,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
 
         # derivatives w.r.t. the latents (cheap), then encoder VJPs per path
         ins = p_params + ([zc] if ctx_m != "none" else [])
-        gs = torch.autograd.grad(L, ins, retain_graph=True)
+        gs = torch.autograd.grad(L + (cfg.dp_weight * dp if dp is not None else 0.0), ins, retain_graph=True)
         gP, dL_dzc = gs[:len(p_params)], (gs[-1] if ctx_m != "none" else None)
         if ctx_m == "mask":  # the encoder learns from the open directions only; P still from all
             L_enc = ((p - zt_d) @ gate.Q).pow(2).mul(gate.w_open()).mean()
