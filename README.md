@@ -247,7 +247,7 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
     grid_b_d128.ipynb        B at D = 128 with the arrow agent and chasing mob (results in /workspace/results_b128)
     grid_b_mechanism.ipynb   what removes the hand, holds the noise, collapses the rank (results in /workspace/results_mech)
     grid_joint.ipynb         the joint model: warmup (reconstruction + prediction), fade, prediction-distillation anchor (results in /workspace/results_joint)
-    grid_joint_dp.ipynb      leaves in the joint model: the decoded-prediction term alone / as the consolidation of a faded reconstruction (results in /workspace/results_joint_dp)
+    grid_joint_dp.ipynb      leaves in the joint model: one plain joint parent, six forks introducing the decoded-prediction term (alone / as the consolidation of a faded reconstruction) (results in /workspace/results_joint_dp)
     docs/findings.md         everything learned so far, with the numbers, the corrections and the open questions
 
 ## Cost

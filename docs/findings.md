@@ -209,7 +209,9 @@ shaped for dynamics.** The hand's dynamics need the terrain next to the agent, w
 consumer with free gain, so the encoder keeps the noise at low amplitude, where it costs almost nothing in the prediction loss. Tested in `grid_joint_dp.ipynb`
 with a **decoded-prediction term** (`Cfg.dp_weight`: `||D(P(z_ctx, a)) − x_next||`, class-weighted), as the only reconstruction-like term (idea 2) or kept while the
 content-agnostic reconstruction is faded (idea 3, `gaf/fork.py`), read by decoders, the latent's variance shares (`readout.variance_shares`) and a timeline
-over the checkpoints. Not run yet.
+over the checkpoints. **Fork design:** one plain `joint` parent (20k, the availability stage); every arm is a fork of its checkpoint that introduces dp
+(`joint_fork(dp=…)`, cross-faded in over the fade): `continue`, `continue + dp`, `fade`, `fade + dp`, `fade-r0 + dp`, `dp only` (reconstruction off and dp on at
+once). So dp's effect is not confounded with the warmup, and `dp only` starts from available content. Not run yet.
 
 ## 9. Revised beliefs
 

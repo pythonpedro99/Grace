@@ -11,11 +11,13 @@ A fork restarts from the checkpoint at the run's last step with a new schedule a
                content) free; SIGReg keeps the latent roughly unit-variance per dimension, so no extra whitening is applied
     freeze     encoder and decoder frozen, only the predictor trains (V-JEPA 2's order: dynamics on a frozen representation)
 
-If the parent was trained with a decoded-prediction term (`Cfg.dp_weight` > 0: the predictor's output decoded against the real next frame), every
-fork keeps it at the parent's weight, so `fade` fades only the content-agnostic reconstruction and the decoded prediction stays as the consolidation.
+Decoded prediction (the predictor's output decoded against the real next frame, `||D(P(z_ctx, a)) - x_next||`, class-weighted):
+    dp=None    the fork keeps the parent's `Cfg.dp_weight` (0 for a plain joint parent), constant
+    dp=w       the fork introduces it: weight ramped 0 -> w over the same `fade` steps as the reconstruction falls (a cross-fade), so one plain
+               joint parent serves every arm. With fade=1 and r_floor=0 the switch is immediate: reconstruction off, decoded prediction on.
 
 A fork writes <run_dir>/forks/<mode>[-<tag>]/ with metrics.csv, a summary.json (the parent's, plus "fork") and ckpt_<parent steps>.pt, so that
-gaf.readout.dynamics / decoder_strength read it like a run. CLI: python -m gaf.fork <run_dir> <mode> [steps fade r_floor beta [tag]].
+gaf.readout.dynamics / decoder_strength read it like a run. CLI: python -m gaf.fork <run_dir> <mode> [steps fade r_floor beta [tag [dp]]].
 """
 import copy
 import json
@@ -47,9 +49,11 @@ def fork_name(mode: str, tag: str = "") -> str:
 
 
 def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor: float = 0.1, beta: float = 10.0, log_every: int = 500,
-               seed: int = 0, verbose: bool = True, tag: str = "") -> Path:
+               seed: int = 0, verbose: bool = True, tag: str = "", dp: float | None = None) -> Path:
     assert mode in MODES, f"unknown mode {mode}"
     d, parent, c, sd = _load(run_dir)
+    dp_w = c.dp_weight if dp is None else float(dp)
+    dp_ramped = dp is not None and c.dp_weight == 0  # introduced by the fork: cross-faded in
     assert c.arm == "joint" and "ae_dec" in sd, "forks start from a finished joint run (arm joint) with a checkpoint at its last step"
     dev = device()
     torch.manual_seed(seed + 77)
@@ -75,6 +79,7 @@ def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor:
         ramp = min(1.0, step / fade) if fade > 0 else 1.0
         r = 1.0 if mode in ("continue", "freeze") else 1.0 + (r_floor - 1.0) * ramp
         b = beta * ramp if mode == "anchor" else 0.0
+        q = dp_w * ramp if dp_ramped else dp_w
         clip = env.sample(c.batch)
         xc, xt, a = clip.x[:, :-1], clip.x[:, -1], clip.a
         with torch.set_grad_enabled(mode != "freeze"):
@@ -88,9 +93,9 @@ def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor:
             l_rec = rec_error(dec(torch.cat([zc, zt[:, None]], 1)), clip.x, clip.f["tile_class"], w, c.env.tile)
             loss = loss + l_sig + r * c.shadow_rec * l_rec
             terms.update(sigreg=l_sig, rec=l_rec)
-        if c.dp_weight > 0:  # decoded prediction, kept at the parent's weight in every fork
+        if dp_w > 0:  # decoded prediction: the parent's weight, or introduced (cross-faded in) by the fork
             l_dp = rec_error(dec(p), xt, clip.f["tile_class"][:, -1], w, c.env.tile)
-            loss = loss + c.dp_weight * l_dp
+            loss = loss + q * l_dp
             terms["dp"] = l_dp
         if snap is not None:
             with torch.no_grad():
@@ -104,22 +109,23 @@ def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor:
         for k, v in terms.items():
             acc.setdefault(k, []).append(v.item())
         if step % log_every == 0 or step == steps:
-            row = {"step": step, "r": r, "beta": b, **{k: sum(v) / len(v) for k, v in acc.items()}}
+            row = {"step": step, "r": r, "beta": b, "dp_w": q, **{k: sum(v) / len(v) for k, v in acc.items()}}
             rows.append(row)
             acc = {}
             pd.DataFrame(rows).to_csv(out / "metrics.csv", index=False)
             if verbose:
                 print(f"[{mode}] step {step}: " + " ".join(f"{k} {v:.4f}" for k, v in row.items() if k != "step"), flush=True)
     torch.save({"enc": enc.state_dict(), "P": P.state_dict(), "ae_dec": dec.state_dict()}, out / f"ckpt_{c.steps}.pt")
-    parent["fork"] = dict(mode=mode, tag=tag, steps=steps, fade=fade, r_floor=r_floor, beta=beta, dp_weight=c.dp_weight, from_run=str(d))
+    parent["fork"] = dict(mode=mode, tag=tag, steps=steps, fade=fade, r_floor=r_floor, beta=beta, dp_weight=dp_w, dp_ramped=dp_ramped, from_run=str(d))
     (out / "summary.json").write_text(json.dumps(parent))
     (out / "done").write_text("ok")
     return out
 
 
-def launch_forks(run_dir, modes=MODES, steps: int = 6000, fade: int = 3000, r_floor: float = 0.1, beta: float = 10.0, tag: str = "") -> dict:
+def launch_forks(run_dir, modes=MODES, steps: int = 6000, fade: int = 3000, r_floor: float = 0.1, beta: float = 10.0, tag: str = "",
+                 dp: float | None = None) -> dict:
     """Start one background process per mode (python -m gaf.fork), surviving the notebook kernel. Modes that are done or running are skipped.
-    `tag` keeps variants side by side (forks/<mode>-<tag>). Returns fork name -> pid."""
+    `tag` keeps variants side by side (forks/<mode>-<tag>); `dp` as in joint_fork. Returns fork name -> pid."""
     run_dir, pids = Path(run_dir), {}
     for m in modes:
         out = run_dir / "forks" / fork_name(m, tag)
@@ -127,7 +133,8 @@ def launch_forks(run_dir, modes=MODES, steps: int = 6000, fade: int = 3000, r_fl
         if (out / "done").exists() or ((out / "pid").exists() and _alive(out / "pid")):
             continue
         with open(out / "log.txt", "a") as log:
-            p = subprocess.Popen([sys.executable, "-m", "gaf.fork", str(run_dir), m, str(steps), str(fade), str(r_floor), str(beta), tag],
+            p = subprocess.Popen([sys.executable, "-m", "gaf.fork", str(run_dir), m, str(steps), str(fade), str(r_floor), str(beta), tag]
+                                 + ([str(dp)] if dp is not None else []),
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         (out / "pid").write_text(str(p.pid))
         pids[fork_name(m, tag)] = p.pid
@@ -158,4 +165,4 @@ if __name__ == "__main__":
     run_dir, mode = sys.argv[1], sys.argv[2]
     num = [float(x) for x in sys.argv[3:7]]
     kw = {k: (int(v) if k in ("steps", "fade") else v) for k, v in zip(("steps", "fade", "r_floor", "beta"), num, strict=False)}
-    joint_fork(run_dir, mode, tag=sys.argv[7] if len(sys.argv) > 7 else "", **kw)
+    joint_fork(run_dir, mode, tag=sys.argv[7] if len(sys.argv) > 7 else "", dp=float(sys.argv[8]) if len(sys.argv) > 8 else None, **kw)

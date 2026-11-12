@@ -478,6 +478,26 @@ def test_decoded_prediction_term_trains_and_forks_keep_it(kw, tmp_path):
     assert math.isfinite(R.probes(d, n_train=256, n_test=64, steps=5)["pm_hand"])
 
 
+def test_fork_introduces_decoded_prediction_on_a_plain_joint_parent(tmp_path):
+    """One plain joint parent serves every arm: dp cross-faded in with the fade, or switched on at once (dp only)."""
+    import pandas as pd
+
+    from gaf import fork as F
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, lam=0.01, rec_class_power=1.0, rec_class_cap=4.0, pred_arch="film", ckpt_every=10)
+    run(cfg, tmp_path, verbose=False)
+    d = tmp_path / cfg.run_id
+    m = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="dp", dp=1.0, log_every=5, verbose=False) / "metrics.csv")
+    assert abs(m["dp_w"].iloc[0] - 0.5) < 1e-6 and abs(m["dp_w"].iloc[-1] - 1.0) < 1e-6 and abs(m["r"].iloc[-1]) < 1e-6  # cross-fade
+    m = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=1, r_floor=0.0, tag="dponly", dp=1.0, log_every=5, verbose=False) / "metrics.csv")
+    assert m["dp_w"].eq(1.0).all() and m["r"].abs().lt(1e-6).all()  # immediate switch
+    m = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, log_every=5, verbose=False) / "metrics.csv")
+    assert "dp" not in m.columns and m["dp_w"].eq(0.0).all()  # no dp: the plain control
+    s = json.loads((d / "forks" / "fade-dp" / "summary.json").read_text())["fork"]
+    assert s["dp_weight"] == 1.0 and s["dp_ramped"]
+
+
 def test_dp_weight_zero_leaves_the_joint_run_unchanged(tmp_path):
     """dp_weight is a late field: default runs keep their ids and have no dp column."""
     import pandas as pd
