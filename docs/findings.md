@@ -35,7 +35,7 @@ reconstruction + prediction + SIGReg.
 
 ---
 
-## 2. The pixel mass law (`grid_mass_law.ipynb`, D = 32 unless stated)
+## 2. The pixel mass law (`04_mass_law.ipynb`, D = 32 unless stated)
 
 1. **What an encoder holds follows the content's share of pixel variance.** Hand readout for 1/2/4/8/16 hand tiles (0.88–12.5 %):
    - `ae` (reconstruction): −0.09 / 0.50 / 0.98 / 0.96 / 0.98, crossing 0.5 at about 1.75 % (mass × D ≈ 0.56);
@@ -57,11 +57,11 @@ reconstruction + prediction + SIGReg.
    recovers weights close to the ground truth (hand about 30× the map weight). Twinkle is over-weighted about 5× (no predictability guard).
    Not yet tested in B.
 
-Earlier context (`sigreg_hypothesis.ipynb`): in the clip world a sprite is held by SIGReg alone only at about 7.7 % pixel share. Scaling the
+Earlier context (`03_sigreg_mass.ipynb`): in the clip world a sprite is held by SIGReg alone only at about 7.7 % pixel share. Scaling the
 whole frame changes nothing (relative share matters). SIGReg on latent differences does not recover sprites. In the grid world, the JEPA
 baselines' latent is about 70–90 % the random map and holds nothing labelled.
 
-## 3. B at D = 128 (`grid_b_d128.ipynb`; arrow agent, chasing mob, hand at 1 tile)
+## 3. B at D = 128 (`05_b_d128.ipynb`; arrow agent, chasing mob, hand at 1 tile)
 
 Final strong probe, live encoder:
 
@@ -85,7 +85,7 @@ Final strong probe, live encoder:
 - **The plain run is a natural experiment.** At about 6k its retention weight dips and the live hand dips (0.65 → 0.30). When the weight
   re-engages, the hand recovers (0.73 by 10k).
 
-## 4. The mechanism stage (`grid_b_mechanism.ipynb`; 2×2 at 15k, class-weighted)
+## 4. The mechanism stage (`06_b_mechanism.ipynb`; 2×2 at 15k, class-weighted)
 
 Open target path on or off (`retain_open` / `retain`) × retention as is or floor on all (`ret_floor_all`, every direction keeps weight ≥ 0.3).
 
@@ -189,7 +189,7 @@ shaped for dynamics.** The hand's dynamics need the terrain next to the agent, w
   latents SIGReg is *more* robust than VICReg ("SIGReg's Gaussianization of h is more robust to non-Gaussian latent variable distributions than
   whitening").
 
-## 8b. The joint model (`grid_joint.ipynb`; ground-truth class weights with cap 4, FiLM predictor, D = 128, 20k warmup, seed 0)
+## 8b. The joint model (`07_joint.ipynb`; ground-truth class weights with cap 4, FiLM predictor, D = 128, 20k warmup, seed 0)
 
 - **The softer cap fixed availability.** The shadow alone (`ae`) now holds mob 0.98, terrain 0.98 and twinkle 0.97 (own decoder; fresh decoder
   mob 0.78, terrain 0.83), against mob 0.07 and terrain −0.05 with cap 30. The earlier "the mob is never learned" was the weights.
@@ -206,7 +206,7 @@ shaped for dynamics.** The hand's dynamics need the terrain next to the agent, w
 - **Instrument caveat:** a fresh decoder of 3000 steps under-reads entangled content (mob, twinkle, facing) relative to the model's own decoder.
 
 **The leaves.** The joint arm does not remove the unpredictable content (twinkle held at 0.83–0.93 by the own decoder, predicted −1.1). Hypothesis: the decoder is a
-consumer with free gain, so the encoder keeps the noise at low amplitude, where it costs almost nothing in the prediction loss. Tested in `grid_joint_dp.ipynb`
+consumer with free gain, so the encoder keeps the noise at low amplitude, where it costs almost nothing in the prediction loss. Tested in `08_joint_dp.ipynb`
 with a **decoded-prediction term** (`Cfg.dp_weight`: `||D(P(z_ctx, a)) − x_next||`, class-weighted), as the only reconstruction-like term (idea 2) or kept while the
 content-agnostic reconstruction is faded (idea 3, `gaf/fork.py`), read by decoders, the latent's variance shares (`readout.variance_shares`) and a timeline
 over the checkpoints. **Fork design:** one plain `joint` parent (20k, the availability stage); every arm is a fork of its checkpoint that introduces dp
@@ -238,7 +238,7 @@ a fragile force balance: lags, floors, weights, the open path.
 latent predictable**. B joins them only by a linear readout, so neither latent has both.
 
 **The recipe these results point to:**
-1. **One encoder with reconstruction + prediction + SIGReg** (the `joint` arm, `grid_joint.ipynb`). Reconstruction keeps the content and
+1. **One encoder with reconstruction + prediction + SIGReg** (the `joint` arm, `07_joint.ipynb`). Reconstruction keeps the content and
    prediction shapes it for dynamics.
 2. **Balanced reconstruction without suppressing what the dynamics need.** A softer weight cap, so terrain stays (the hand depends on it), and
    label-free weights (clusters with position types) once validated.
@@ -252,7 +252,7 @@ latent predictable**. B joins them only by a linear readout, so neither latent h
 
 ## 11. Open questions, in order
 
-1. **The leaves in the joint model** (`grid_joint_dp.ipynb`): the decoded-prediction term alone (idea 2) and as the consolidation of a faded reconstruction
+1. **The leaves in the joint model** (`08_joint_dp.ipynb`): the decoded-prediction term alone (idea 2) and as the consolidation of a faded reconstruction
    (idea 3), with pre-registered expectations. The joint arm itself is run (section 8b).
 2. **Terrain and mob in the latent:** an unweighted decoder readout, and a softer class-weight cap.
 3. **An independence-based noise criterion** against the current release rule.
@@ -281,5 +281,5 @@ latent predictable**. B joins them only by a linear readout, so neither latent h
 | class weights | `train.class_weights`, `cluster_classes`, `rec_error` (`rec_class_power`, `rec_clusters`, `rec_pos_types`) |
 | retention options | `retain.RefMap` (`ret_floor_all`, `ret_w_min`, `ret_ac`) |
 | predictors | `models.Predictor`, `models.FiLMPredictor` (`pred_arch`) |
-| notebooks | `grid_mass_law`, `grid_b_d128`, `grid_b_mechanism`, `grid_joint` |
+| notebooks | `notebooks/` (numbered in order: `04_mass_law` … `08_joint_dp`); results in `results/<notebook name>/` |
 | method description | `docs/reference_gated_retention.md` |

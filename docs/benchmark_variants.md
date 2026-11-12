@@ -4,7 +4,7 @@ Both keep the content that is predictable from the action but not yet learned, a
 They share one encoder across all frames (no BatchNorm: per-sample normalisation keeps the target and
 context paths separable), a predictor that sees the context latents and the actions, SIGReg, and AdamW
 (lr 1e-3, weight decay 0.01, batch 256 clips, SIGReg weight λ = 0.1, 256 slices). Background and evidence:
-[plan.md](../plan.md) and [reference_gated_retention.md](reference_gated_retention.md).
+[plan.md](plan.md) and [reference_gated_retention.md](reference_gated_retention.md).
 
 **The noise mechanism both use: the floor-gated open target path.** Every 1000 steps (from step 500) the
 encoder is frozen, 16 384 fresh clips are encoded and a fresh predictor of the same size is trained on them

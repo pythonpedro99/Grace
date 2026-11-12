@@ -160,7 +160,7 @@ hard), SFA as a diagnostic, and an S defined as a subspace instead of per-direct
 
 ## Hypothesis: the sprites are lost in a race (notebook stage 7)
 
-Result of `results_v1` (3 seeds): `lewm` keeps only slow content; `sg` and all three fixes also lose fast
+Result of `results/gain_attribution/v1` (3 seeds): `lewm` keeps only slow content; `sg` and all three fixes also lose fast
 and hard; `ema` keeps and learns fast in 2 of 3 seeds (0.99), not hard; `both` drops noise (0.10) with slow
 intact. At the first eval (step 500) `sg`, `context`, `target` and `both` are identical: before the first
 floor everything is protected, the open path is closed, and the projection changes the update by under
@@ -214,7 +214,7 @@ Reading guide: the table at the end of notebook stage 7. If a head start keeps f
 schedule, not a better gradient rule. Candidates if not: anchoring S to a lagged encoder, or freezing the
 encoder's effect on S in the update.
 
-## Grid world (`grid_benchmark.ipynb`)
+## Grid world (`02_grid_benchmark.ipynb`)
 
 The stepping stone between the clip world and Craftax: it tests the core models on discrete, relational content before
 the first real benchmark. Design decisions:

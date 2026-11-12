@@ -142,7 +142,7 @@ def test_frame_difference_reconstruction(tmp_path):
     assert "shadow" in torch.load(tmp_path / cfg.run_id / "model.pt")
 
 
-MASS = GridCfg(W=12, H=8, n_slow=16, hand_tiles=4, compass_tiles=3)  # the frame of grid_mass_law.ipynb (48 x 48)
+MASS = GridCfg(W=12, H=8, n_slow=16, hand_tiles=4, compass_tiles=3)  # the frame of notebooks/04_mass_law.ipynb (48 x 48)
 
 
 def _tile(img, c, row, col):  # (..., 3, res, res) in [0, 1] -> the colour of tile (row, col) at its top-left pixel

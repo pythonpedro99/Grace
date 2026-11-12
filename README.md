@@ -6,7 +6,7 @@ encoder discard real noise? The fix: the encoder may simplify the target latent 
 the predictor has stopped improving and sits near its achievable error floor.
 
 Spec: `docs/gain_attribution_one_pager.pdf` (section numbers below refer to it). Design decisions
-where the one-pager is silent, and the critical points of the experiment: [plan.md](plan.md).
+where the one-pager is silent, and the critical points of the experiment: [docs/plan.md](docs/plan.md).
 
 **The two variants for the benchmark** (architecture, losses, hyperparameters, status):
 [docs/benchmark_variants.md](docs/benchmark_variants.md): A, `target` + head start, and B, reference-gated retention
@@ -57,7 +57,7 @@ slow content alone is an exact isotropic Gaussian, is its own notebook stage (4b
 Knobs: `n_slow`, `slow_rho`, `n_noise`, `v_act`, `h_act` (action strength), `hard_k`
 (difficulty), `a_*` (salience), `swap_colors` (fast red / hard white), `pixel_noise`, `res`, `T`.
 
-## The grid world (`gaf/env_grid.py`, `grid_benchmark.ipynb`)
+## The grid world (`gaf/env_grid.py`, `notebooks/02_grid_benchmark.ipynb`)
 
 The stepping stone to Craftax: the same four groups, but discrete, relational and Craftax-shaped. A 10×8 tile map with
 wood, stone and water (a new map per clip), two HUD rows below it, 40×40 pixels. Actions are one-hot over noop, up, down,
@@ -83,7 +83,7 @@ Knobs: `W`, `H`, `tile`, `n_slow`, `levels`, `hud_p`, `density`, `random_map`, `
 visible in a share of the clips; hidden ones show the average hand colour). `component_masses()` gives each component's share of the
 pixel variance, and `f["tile_class"]` the ground-truth class of every tile.
 
-`grid_mass_law.ipynb` tests the working rule "a class is held only if its share m of the pixel variance satisfies m · D ≥ κ": the
+`notebooks/04_mass_law.ipynb` tests the working rule "a class is held only if its share m of the pixel variance satisfies m · D ≥ κ": the
 hand's mass against the latent size D (SIGReg alone and an autoencoder), frequency against size, a fixed-location facing, the recipe
 (`sg`, a head start and `retain_open` below and above the threshold), and a class-balanced reconstruction loss (`rec_class_power`).
 
@@ -106,7 +106,7 @@ projected).
 | `retain` | `g_ctx` + retention | none | experimental, unsupervised: reference-gated retention alone (`docs/reference_gated_retention.md`) |
 | `retain_open` | `g_ctx` + retention | `g_open` | the same plus the floor-gated open path that removes noise |
 | `ae` | none | none | an autoencoder: reconstruction (`shadow_rec`) + SIGReg, no prediction loss; B's shadow encoder on its own |
-| `joint` | `g_ctx` | none | one encoder with reconstruction (keeps the content) + prediction (shapes it for dynamics) + SIGReg (`grid_joint.ipynb`) |
+| `joint` | `g_ctx` | none | one encoder with reconstruction (keeps the content) + prediction (shapes it for dynamics) + SIGReg (`notebooks/07_joint.ipynb`) |
 
 Every arm runs the same optimizer, gate and diagnostics, so the leak can be compared across arms.
 
@@ -148,7 +148,7 @@ race against the predictor (notebook stage 7).
     but not learned from not-yet-learned, since both sit at floor ≈ 0. `basis="dim"` uses latent
     dims.
   - Other possible bases (slow feature analysis on z_{t+1} − z_t; action controllability from a
-    probe without actions; progress C_lag − C_P) are compared in plan.md.
+    probe without actions; progress C_lag − C_P) are compared in docs/plan.md.
 - **Projection on the applied AdamW step (§6, §10), `grads.SplitAdamW`:**
   - The one-pager derives the projection for SGD. An AdamW step is `−lr (M m̂ + wd θ)`, where
     `M = 1/(√v̂ + ε)` is the preconditioner and the momentum `m̂` is about 90% past gradients.
@@ -195,9 +195,9 @@ race against the predictor (notebook stage 7).
 **RunPod GPU pod (PyTorch template):**
 
 1. Upload or clone this folder to `/workspace`.
-2. Open `gain_attribution.ipynb` and run it top to bottom.
+2. Open `notebooks/01_gain_attribution.ipynb` and run it top to bottom.
 
-Results go to `/workspace/results/<run_id>/`: `metrics.csv`, `dirs.npz`, `model.pt`,
+Results go to `/workspace/results/gain_attribution/<run_id>/`: `metrics.csv`, `dirs.npz`, `model.pt`,
 `summary.json` and `log.txt`. A run whose `summary.json` exists is skipped, so re-running a cell
 resumes.
 
@@ -212,7 +212,7 @@ Every long cell shows a progress bar:
 
 `WORKERS = 3` in the notebook runs three runs at once, as separate processes on the same GPU. The
 model is small and the GPU mostly waits on kernel launches, so this is close to a 3× speed-up. Watch
-one run with `tail -f /workspace/results/<run_id>/log.txt`.
+one run with `tail -f /workspace/results/gain_attribution/<run_id>/log.txt`.
 
 Rough budget: 4–7 min per run alone; the full notebook (39 runs) takes about 3–4.5 h sequentially,
 roughly 1–2 h with 3 workers. These are estimates; the first stage prints real timings.
@@ -240,15 +240,17 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
     gaf/readout.py   decoder-based readouts of a checkpoint: dynamics() (decoded predicted frames), decoder_strength()
     gaf/fork.py      forks of a finished joint run: continue / fade / anchor (prediction distillation) / freeze, from its checkpoint
     tests/           CPU checks
-    gain_attribution.ipynb   the clip world
-    grid_benchmark.ipynb     the grid world (results in /workspace/results_grid)
-    sigreg_hypothesis.ipynb  does SIGReg select content by pixel mass? (clip world, and the SIGReg weight in the grid world)
-    grid_mass_law.ipynb      the mass law in the grid world (results in /workspace/results_masslaw)
-    grid_b_d128.ipynb        B at D = 128 with the arrow agent and chasing mob (results in /workspace/results_b128)
-    grid_b_mechanism.ipynb   what removes the hand, holds the noise, collapses the rank (results in /workspace/results_mech)
-    grid_joint.ipynb         the joint model: warmup (reconstruction + prediction), fade, prediction-distillation anchor (results in /workspace/results_joint)
-    grid_joint_dp.ipynb      leaves in the joint model: one plain joint parent, six forks introducing the decoded-prediction term (alone / as the consolidation of a faded reconstruction) (results in /workspace/results_joint_dp)
-    docs/findings.md         everything learned so far, with the numbers, the corrections and the open questions
+    notebooks/       one per experiment, numbered in order; each writes to /workspace/results/<name>/ (local copies in results/<name>/)
+      01_gain_attribution.ipynb  the clip world
+      02_grid_benchmark.ipynb    the grid world
+      03_sigreg_mass.ipynb       does SIGReg select content by pixel mass? (clip world, and the SIGReg weight in the grid world)
+      04_mass_law.ipynb          the mass law in the grid world
+      05_b_d128.ipynb            B at D = 128 with the arrow agent and chasing mob
+      06_b_mechanism.ipynb       what removes the hand, holds the noise, collapses the rank
+      07_joint.ipynb             the joint model: warmup (reconstruction + prediction), fade, prediction-distillation anchor
+      08_joint_dp.ipynb          leaves in the joint model: one plain joint parent, six forks introducing the decoded-prediction term
+    results/         downloaded results, one folder per notebook (git-ignored)
+    docs/findings.md   everything learned so far, with the numbers, the corrections and the open questions
 
 ## Cost
 

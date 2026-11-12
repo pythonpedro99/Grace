@@ -19,7 +19,7 @@ block movement, and the border counts as stone. random_map: a new map per clip (
 one map fixed by the seed. Actions are one-hot over (noop, up, down, left, right); the predictor sees
 all T-1 of them. The frame is W x W tiles: H map rows, then W - H HUD rows.
 
-Knobs for the mass experiments (grid_mass_law.ipynb), all off by default:
+Knobs for the mass experiments (notebooks/04_mass_law.ipynb), all off by default:
     hand_tiles     the hand is shown in this many HUD tiles (its pixel mass grows with it)
     compass_tiles  the facing is also shown in this many HUD tiles (a fixed-location copy of the marker)
     hand_contrast  the hand tiles' colour contrast against the average hand colour (1: the material colours; 0.5: a quarter of the
