@@ -16,8 +16,12 @@ Decoded prediction (the predictor's output decoded against the real next frame, 
     dp=w       the fork introduces it: weight ramped 0 -> w over the same `fade` steps as the reconstruction falls (a cross-fade), so one plain
                joint parent serves every arm. With fade=1 and r_floor=0 the switch is immediate: reconstruction off, decoded prediction on.
 
+Target gradient (tgt=w > 0): the prediction error also reaches the encoder through the target, ||sg(P(z_ctx, a)) - z_next||^2, weight ramped
+0 -> w over the fade (LeWM-style, ungated). The latent prediction above keeps its stop-gradient, so with w = 1 the encoder sees the full
+gradient of ||P(z_ctx, a) - z_next||^2. It actively removes what the predictor cannot produce (an active release, not a drift).
+
 A fork writes <run_dir>/forks/<mode>[-<tag>]/ with metrics.csv, a summary.json (the parent's, plus "fork") and ckpt_<parent steps>.pt, so that
-gaf.readout.dynamics / decoder_strength read it like a run. CLI: python -m gaf.fork <run_dir> <mode> [steps fade r_floor beta [tag [dp]]].
+gaf.readout.dynamics / decoder_strength read it like a run. CLI: python -m gaf.fork <run_dir> <mode> [steps fade r_floor beta [tag [dp|none [tgt]]]].
 """
 import copy
 import json
@@ -49,7 +53,8 @@ def fork_name(mode: str, tag: str = "") -> str:
 
 
 def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor: float = 0.1, beta: float = 10.0, log_every: int = 500,
-               seed: int = 0, verbose: bool = True, tag: str = "", dp: float | None = None) -> Path:
+               seed: int = 0, verbose: bool = True, tag: str = "", dp: float | None = None,
+               tgt: float = 0.0) -> Path:
     assert mode in MODES, f"unknown mode {mode}"
     d, parent, c, sd = _load(run_dir)
     dp_w = c.dp_weight if dp is None else float(dp)
@@ -80,6 +85,7 @@ def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor:
         r = 1.0 if mode in ("continue", "freeze") else 1.0 + (r_floor - 1.0) * ramp
         b = beta * ramp if mode == "anchor" else 0.0
         q = dp_w * ramp if dp_ramped else dp_w
+        tg = tgt * ramp if mode != "freeze" else 0.0
         clip = env.sample(c.batch)
         xc, xt, a = clip.x[:, :-1], clip.x[:, -1], clip.a
         with torch.set_grad_enabled(mode != "freeze"):
@@ -93,6 +99,10 @@ def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor:
             l_rec = rec_error(dec(torch.cat([zc, zt[:, None]], 1)), clip.x, clip.f["tile_class"], w, c.env.tile)
             loss = loss + l_sig + r * c.shadow_rec * l_rec
             terms.update(sigreg=l_sig, rec=l_rec)
+        if tgt > 0 and mode != "freeze":  # the target gradient: the encoder moves z_next towards the (fixed) prediction
+            l_tgt = (p.detach() - zt).pow(2).mean()
+            loss = loss + tg * l_tgt
+            terms["tgt"] = l_tgt
         if dp_w > 0:  # decoded prediction: the parent's weight, or introduced (cross-faded in) by the fork
             l_dp = rec_error(dec(p), xt, clip.f["tile_class"][:, -1], w, c.env.tile)
             loss = loss + q * l_dp
@@ -109,23 +119,23 @@ def joint_fork(run_dir, mode: str, steps: int = 6000, fade: int = 3000, r_floor:
         for k, v in terms.items():
             acc.setdefault(k, []).append(v.item())
         if step % log_every == 0 or step == steps:
-            row = {"step": step, "r": r, "beta": b, "dp_w": q, **{k: sum(v) / len(v) for k, v in acc.items()}}
+            row = {"step": step, "r": r, "beta": b, "dp_w": q, "tgt_w": tg, **{k: sum(v) / len(v) for k, v in acc.items()}}
             rows.append(row)
             acc = {}
             pd.DataFrame(rows).to_csv(out / "metrics.csv", index=False)
             if verbose:
                 print(f"[{mode}] step {step}: " + " ".join(f"{k} {v:.4f}" for k, v in row.items() if k != "step"), flush=True)
     torch.save({"enc": enc.state_dict(), "P": P.state_dict(), "ae_dec": dec.state_dict()}, out / f"ckpt_{c.steps}.pt")
-    parent["fork"] = dict(mode=mode, tag=tag, steps=steps, fade=fade, r_floor=r_floor, beta=beta, dp_weight=dp_w, dp_ramped=dp_ramped, from_run=str(d))
+    parent["fork"] = dict(mode=mode, tag=tag, steps=steps, fade=fade, r_floor=r_floor, beta=beta, dp_weight=dp_w, dp_ramped=dp_ramped, tgt=tgt, from_run=str(d))
     (out / "summary.json").write_text(json.dumps(parent))
     (out / "done").write_text("ok")
     return out
 
 
 def launch_forks(run_dir, modes=MODES, steps: int = 6000, fade: int = 3000, r_floor: float = 0.1, beta: float = 10.0, tag: str = "",
-                 dp: float | None = None) -> dict:
+                 dp: float | None = None, tgt: float = 0.0) -> dict:
     """Start one background process per mode (python -m gaf.fork), surviving the notebook kernel. Modes that are done or running are skipped.
-    `tag` keeps variants side by side (forks/<mode>-<tag>); `dp` as in joint_fork. Returns fork name -> pid."""
+    `tag` keeps variants side by side (forks/<mode>-<tag>); `dp`, `tgt` as in joint_fork. Returns fork name -> pid."""
     run_dir, pids = Path(run_dir), {}
     for m in modes:
         out = run_dir / "forks" / fork_name(m, tag)
@@ -134,7 +144,7 @@ def launch_forks(run_dir, modes=MODES, steps: int = 6000, fade: int = 3000, r_fl
             continue
         with open(out / "log.txt", "a") as log:
             p = subprocess.Popen([sys.executable, "-m", "gaf.fork", str(run_dir), m, str(steps), str(fade), str(r_floor), str(beta), tag]
-                                 + ([str(dp)] if dp is not None else []),
+                                 + [str(dp) if dp is not None else "none", str(tgt)],
                                  stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         (out / "pid").write_text(str(p.pid))
         pids[fork_name(m, tag)] = p.pid
@@ -157,7 +167,7 @@ def status(run_dir, modes=MODES) -> pd.DataFrame:
         out = Path(run_dir) / "forks" / m
         h = pd.read_csv(out / "metrics.csv") if (out / "metrics.csv").exists() else None
         rows[m] = {"state": "done" if (out / "done").exists() else ("running" if (out / "pid").exists() and _alive(out / "pid") else "not started"),
-                   "step": int(h.step.iloc[-1]) if h is not None else 0, **({k: round(float(h[k].iloc[-1]), 4) for k in ("pred", "rec", "dp", "anchor") if h is not None and k in h})}
+                   "step": int(h.step.iloc[-1]) if h is not None else 0, **({k: round(float(h[k].iloc[-1]), 4) for k in ("pred", "rec", "dp", "tgt", "anchor") if h is not None and k in h})}
     return pd.DataFrame(rows).T
 
 
@@ -165,4 +175,6 @@ if __name__ == "__main__":
     run_dir, mode = sys.argv[1], sys.argv[2]
     num = [float(x) for x in sys.argv[3:7]]
     kw = {k: (int(v) if k in ("steps", "fade") else v) for k, v in zip(("steps", "fade", "r_floor", "beta"), num, strict=False)}
-    joint_fork(run_dir, mode, tag=sys.argv[7] if len(sys.argv) > 7 else "", dp=float(sys.argv[8]) if len(sys.argv) > 8 else None, **kw)
+    dp = sys.argv[8] if len(sys.argv) > 8 else "none"
+    joint_fork(run_dir, mode, tag=sys.argv[7] if len(sys.argv) > 7 else "", dp=None if dp == "none" else float(dp),
+               tgt=float(sys.argv[9]) if len(sys.argv) > 9 else 0.0, **kw)

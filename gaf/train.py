@@ -602,14 +602,6 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                 pd.DataFrame(rows).to_csv(odir / "metrics.csv", index=False)
             if cfg.log_mech:
                 save_dirs()
-            if cfg.ckpt_every and (step + 1) % cfg.ckpt_every == 0:
-                torch.save({"step": step + 1, "enc": enc.state_dict(), "P": P.state_dict(),
-                            **({"shadow": shadow.state_dict(), "dec": dec.state_dict() if dec else None, "Qs": Qs.state_dict(),
-                                "Rh": Rh.state_dict(),
-                                "ref": {k: getattr(ref, k).cpu() for k in ("mu", "W", "V", "M", "w", "rho", "gap", "err", "err_live", "ac")}}
-                               if use_ret else {}),
-                            **({"ae_dec": ae_dec.state_dict()} if use_ae else {}),
-                            "gate": {"Q": gate.Q.cpu(), "inS": gate.inS.cpu()}}, odir / f"ckpt_{step + 1}.pt")
             acc.clear()
             if verbose:
                 log(f"  [{cfg.arm} s{cfg.seed}] step {step + 1:>6}  loss {row['loss']:.4f}  "
@@ -623,6 +615,15 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
                     stopped_at = step + 1
                     log(f"  [{cfg.arm} s{cfg.seed}] settled at step {stopped_at}: stopping (cap {cfg.steps})")
                     break
+        # at every ckpt_every steps, not only at eval steps (eval_every need not divide ckpt_every)
+        if cfg.ckpt_every and (step + 1) % cfg.ckpt_every == 0:
+            torch.save({"step": step + 1, "enc": enc.state_dict(), "P": P.state_dict(),
+                        **({"shadow": shadow.state_dict(), "dec": dec.state_dict() if dec else None, "Qs": Qs.state_dict(),
+                            "Rh": Rh.state_dict(),
+                            "ref": {k: getattr(ref, k).cpu() for k in ("mu", "W", "V", "M", "w", "rho", "gap", "err", "err_live", "ac")}}
+                           if use_ret else {}),
+                        **({"ae_dec": ae_dec.state_dict()} if use_ae else {}),
+                        "gate": {"Q": gate.Q.cpu(), "inS": gate.inS.cpu()}}, odir / f"ckpt_{step + 1}.pt")
 
     if on_step:
         on_step(cfg.steps, "final probes")

@@ -523,3 +523,31 @@ def test_visible_hand_probe():
     enc = torch.nn.Sequential(torch.nn.Flatten(), torch.nn.Linear(3 * 48 * 48, 8))
     out = parts_probe(enc, env, n_train=256, n_test=128, steps=5)
     assert "pm_hand_visible" in out and "pm_rank" in out
+
+
+def test_checkpoints_do_not_depend_on_eval_steps(tmp_path):
+    """ckpt_every is honoured even when eval_every does not divide it (08_joint_dp: eval 2000, ckpt 5000)."""
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=4, diag_every=5, probe_n=64, mlp_n=128,
+              mlp_steps=3, lam=0.01, ckpt_every=5)
+    run(cfg, tmp_path, verbose=False)
+    assert sorted(p.name for p in (tmp_path / cfg.run_id).glob("ckpt_*.pt")) == ["ckpt_10.pt", "ckpt_5.pt"]
+
+
+def test_fork_target_gradient_is_ramped_and_reaches_the_encoder(tmp_path):
+    """tgt > 0 adds the target gradient (prediction error through z_next) cross-faded in with the fade; tgt = 0 leaves the fork as it was."""
+    import pandas as pd
+
+    from gaf import fork as F
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, lam=0.01, rec_class_power=1.0, rec_class_cap=4.0, pred_arch="film", ckpt_every=10)
+    run(cfg, tmp_path, verbose=False)
+    d = tmp_path / cfg.run_id
+    m = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="tgt", dp=1.0, tgt=1.0, log_every=5, verbose=False) / "metrics.csv")
+    assert abs(m["tgt_w"].iloc[0] - 0.5) < 1e-6
+    assert abs(m["tgt_w"].iloc[-1] - 1.0) < 1e-6
+    assert "tgt" in m.columns
+    m0 = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="notgt", dp=1.0, log_every=5, verbose=False) / "metrics.csv")
+    assert m0["tgt_w"].eq(0.0).all()
+    assert "tgt" not in m0.columns
