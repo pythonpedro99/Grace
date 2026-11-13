@@ -249,6 +249,39 @@ Parent at 20k reproduces notebook 07 (predicted move-step facing 0.69, agent 0.7
 7. **Rank does not collapse** (98 → 104 in every fork). **The twinkle's variance share is 0.00 in every run** (including the parent, where it is held at 0.89), so it carries no information here:
    low amplitude is not selective (facing and hand are as quiet), and the vote counts only the two decoder instruments.
 
+**Fresh-decoder readout and the target-gradient fork** (re-run of the readouts after the first pass; numbers fresh decoder, 5k steps, own decoder in brackets):
+
+| | agent | facing | hand | twinkle | pred facing (move) / hand / mob | rank |
+|---|---|---|---|---|---|---|
+| parent | 0.92 (0.96) | 0.97 (0.96) | 0.98 | 0.76 (0.89) | 0.68 / 0.30 / 0.23 | 98 |
+| `fade` | 0.76 (0.86) | 0.56 (0.77) | 0.99 | 0.48 (0.73) | 0.62 / 0.41 / −0.02 | |
+| `fade-r0 + dp` | 0.75 (0.74) | 0.42 (0.49) | 0.99 | −0.02 (−0.01) | 0.97 / 0.61 / 0.61 | 104 |
+| `fade-r0 + dp + tgt` | **0.87 (0.93)** | **0.87 (0.88)** | 0.99 (own 0.82) | −0.02 (−0.01) | 0.99 / 0.50 / 0.56 | 101 |
+
+- **The fresh decoder confirms the loss** (H2b, H3 fail by the pre-registered rule): facing −0.28 (`fade + dp`) to −0.55 (strict), agent −0.12 to −0.17, against −0.41 / −0.15 for the plain fade.
+  The mob reads 0.01-0.02 by the fresh decoder in every fork (parent 0.22), so it under-reads entangled content here; the mob verdicts rest on the own decoder.
+- **The target gradient recovers most of the facing** (0.42 → 0.87, agent 0.75 → 0.87) and releases the noise as completely as without it (twinkle −0.02), rank 101, dynamics kept (predicted facing 0.99).
+  E1 (faster release than `fade-r0 + dp`) fails because the release was already complete; E3 (no rank collapse) holds, unlike the open path in notebook 06; E2 (holds) just misses
+  (facing −0.10, own facing −0.08 against 0.05). It is the best strict model so far, and it needs no pixel term beyond the decoded prediction.
+- **Reading (hypothesis, the shuffled-action test is not run):** the facing follows from the actions, so (predictor, decoder) can draw it without the encoder holding it.
+  The "agent" readout is the arrow silhouette, so the agent loss contains the facing. The target gradient pulls the real next latent towards the prediction, which carries the facing, and
+  that puts it back into the latent. The prediction-gated reconstruction (`gate`) is the other candidate for a hold reward on the real latent.
+
+**Shuffled-action test and the agent split** (`readout.action_test`, own decoder on the saved checkpoints; the predictor's output is decoded and the arrow's orientation read where it is drawn):
+
+| | real inputs: facing right (move / no-op) | last action replaced: follows the fed action / the true facing | context latents shuffled (move) | agent position, real next frame / predicted |
+|---|---|---|---|---|
+| parent | 0.59 / 0.94 | 0.59 / 0.25 | 0.34 | 0.99 / 0.83 |
+| `fade` | 0.56 / 0.72 | 0.56 / 0.24 | 0.45 | |
+| `fade + dp` | 0.93 / 0.92 | 0.94 / 0.26 | 0.78 | |
+| `fade-r0 + dp` | 0.97 / 0.84 | **0.97 / 0.25** | **0.93** | **0.99 / 0.98** |
+
+- **The predicted facing is drawn from the action**: in the strict fork the arrow follows whatever last action is fed (0.97) and agrees with the true facing only at chance (0.25);
+  with the context shuffled across clips it stays at 0.93. The parent's predictor is action-driven as well (0.59 follows the fed action = its accuracy), only less accurate.
+- **The agent's position is held** (0.99 by the own decoder on the real next frame, in the strict fork too), so the "agent" loss is the arrow's orientation, as expected from the silhouette.
+- Together with the fresh decoder (real latent: facing 0.42) this is the bypass: the pair (predictor, decoder) can draw the facing from the action, so the decoded prediction is satisfied
+  without the encoder holding it. The remaining link, that this is why the latent loses it, is inferred (the fork with the target gradient restores it); the test in the notebook repeats this on every fork.
+
 **Conclusion.** The decoded prediction does what it was built for: the learned content that the fade eroded (mob, terrain, hand) is kept, the unpredictable twinkle goes, and the dynamics
 get clearly better. The cost is on agent and facing under a strict fade, which the own decoder reports as lost and the predictor as perfectly foreseen. The one open measurement decides it:
 the fresh decoder on parent, `fade`, `fade + dp` and `fade-r0 + dp`. If facing and agent are in the latent there, the recipe (warm up with reconstruction, then switch to the decoded prediction) works, and

@@ -79,6 +79,10 @@ def _scorer(ck, ev):
             lum = xh.mean(1).view(n, W, t, W, t)[torch.arange(n), xy[:, 1], :, xy[:, 0]]
             hit = torch.einsum("nij,kij->nk", lum - lum.mean((1, 2), keepdim=True), tmpl).argmax(1) == face
             row["facing acc"], row["facing acc, move steps"] = hit.float().mean().item(), hit[move].float().mean().item()
+            # position read apart from the orientation: the tile whose luminance matches any arrow silhouette best is the agent's tile
+            lt = xh.mean(1).view(n, W, t, W, t).permute(0, 1, 3, 2, 4).reshape(n, W * W, t, t)
+            corr = torch.einsum("nsij,kij->nsk", lt - lt.mean((2, 3), keepdim=True), tmpl).max(-1).values
+            row["agent position acc"] = (corr.argmax(1) == xy[:, 1] * W + xy[:, 0]).float().mean().item()
         return row
     return score
 
@@ -99,11 +103,12 @@ def dynamics(run_dir, n_eval: int = 2048, step=None) -> pd.DataFrame:
     return pd.DataFrame(rows).T
 
 
-def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int = 256, step=None) -> pd.DataFrame:
+def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int = 256, step=None, matched: bool = False) -> pd.DataFrame:
     """Freeze each encoder of the checkpoint, train a fresh decoder (class-weighted pixel loss, as the shadow) on its latent and decode
-    held-out frames. Note: the class weights down-weight terrain and mob, so this under-reads those two."""
+    held-out frames. Note: with the default class weights (cap 30) terrain and mob are down-weighted, so this under-reads those two;
+    matched=True trains the decoder with the checkpoint's own weights (its rec_class_power and rec_class_cap), as the model was trained."""
     ck = load(run_dir, step)
-    w, _ = class_weights(ck.env, 1.0)
+    w, _ = class_weights(ck.env, ck.c.rec_class_power, cap=ck.c.rec_class_cap) if matched else class_weights(ck.env, 1.0)
     ev = ck.env.sample(n_eval)
     score, rows = _scorer(ck, ev), {}
     for name, (E, _, _) in systems(ck).items():
@@ -148,3 +153,45 @@ def probes(run_dir, n_train: int = 8000, n_test: int = 2048, steps: int = 800, s
     from .probes import parts_probe
     ck = load(run_dir, step)
     return parts_probe(systems(ck)["live"][0], ck.env, n_train=n_train, n_test=n_test, steps=steps)
+
+
+def action_test(run_dir, n_eval: int = 2048, step=None, seed: int = 0) -> pd.DataFrame:
+    """Does the predictor draw the facing from the ACTION or from the context latent? The predictor's output is decoded and the arrow's
+    orientation is read at the tile where the arrow is drawn (no training: the model's own decoder). The predictor is fed altered inputs
+    and the answer compared with (a) the true facing of the next frame and (b) the facing the FED last action implies (a move turns the
+    agent: facing = action - 1). Rows: real inputs; the last action replaced by a random move; the context latents shuffled across clips
+    (actions kept). Columns, on move steps: share equal to the true facing, share equal to the fed action's facing; no-op steps (where the
+    facing must come from the context): share equal to the true facing."""
+    import torch.nn.functional as Fn
+    ck = load(run_dir, step)
+    E, Pr, dec = systems(ck)["live"]
+    env, dev, c = ck.env, ck.dev, ck.c
+    t, W = c.env.tile, c.env.W
+    tmpl = env.arrow_mask[:, :t, :t].float()
+    tmpl = tmpl - tmpl.mean((1, 2), keepdim=True)
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    ev = env.sample(n_eval)
+    with torch.no_grad():
+        zc = E(ev.x[:, :-1])
+    face, last = ev.f["fast"][:, -1, :4].argmax(1), ev.a[:, -1].argmax(1)
+    move = last > 0
+
+    @torch.no_grad()
+    def read(z, a):
+        xh = dec(Pr(z, a))
+        lt = xh.mean(1).view(n_eval, W, t, W, t).permute(0, 1, 3, 2, 4).reshape(n_eval, W * W, t, t)
+        corr = torch.einsum("nsij,kij->nsk", lt - lt.mean((2, 3), keepdim=True), tmpl)
+        tile = corr.max(-1).values.argmax(1)
+        return corr[torch.arange(n_eval), tile].argmax(-1)
+
+    def row(guess, fed_face):
+        return {"vs true (move)": (guess == face)[move].float().mean().item(), "vs fed action (move)": (guess == fed_face)[move].float().mean().item(),
+                "vs true (no-op)": (guess == face)[~move].float().mean().item()}
+
+    rows = {"real inputs": row(read(zc, ev.a), last - 1)}
+    fed = torch.randint(1, 5, (n_eval,), generator=g).to(dev)  # a random move, whatever the true action was
+    a2 = ev.a.clone()
+    a2[:, -1] = Fn.one_hot(fed, a2.shape[-1]).to(a2.dtype)
+    rows["last action replaced"] = row(read(zc, a2), fed - 1)
+    rows["context latents shuffled"] = row(read(zc[torch.randperm(n_eval, generator=g).to(dev)], ev.a), last - 1)
+    return pd.DataFrame(rows).T

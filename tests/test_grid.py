@@ -551,3 +551,22 @@ def test_fork_target_gradient_is_ramped_and_reaches_the_encoder(tmp_path):
     m0 = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="notgt", dp=1.0, log_every=5, verbose=False) / "metrics.csv")
     assert m0["tgt_w"].eq(0.0).all()
     assert "tgt" not in m0.columns
+
+
+def test_fork_prediction_gated_reconstruction(tmp_path):
+    """gate=tau adds a reconstruction of the real next frame weighted per tile by how well the prediction explained it; ramped in with the fade."""
+    import pandas as pd
+
+    from gaf import fork as F
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, lam=0.01, rec_class_power=1.0, rec_class_cap=4.0, pred_arch="film", ckpt_every=10)
+    run(cfg, tmp_path, verbose=False)
+    d = tmp_path / cfg.run_id
+    m = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="g", dp=1.0, gate=0.25, tgt=1.0, log_every=5, verbose=False) / "metrics.csv")
+    assert abs(m["gate_r"].iloc[-1] - 1.0) < 1e-6
+    assert "gate_rec" in m.columns
+    assert m["gate_w"].between(0.0, 1.0).all()
+    m0 = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="nog", dp=1.0, log_every=5, verbose=False) / "metrics.csv")
+    assert "gate_rec" not in m0.columns
+    assert m0["gate_r"].eq(0.0).all()
