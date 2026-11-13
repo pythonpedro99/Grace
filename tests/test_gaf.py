@@ -234,6 +234,9 @@ def test_execute_sequential_shows_a_bar(tmp_path, capsys):
     execute([Cfg(arm="sg", seed=0, **TINY), Cfg(arm="detached", seed=0, **TINY)], tmp_path)
     err = capsys.readouterr().err
     assert "training" in err and "100%" in err and len(collect(tmp_path)) == 2
+    import json  # the sequential path writes progress.json too (analysis.progress of a background launch with workers=1)
+    pr = json.loads((tmp_path / Cfg(arm="sg", seed=0, **TINY).run_id / "progress.json").read_text())
+    assert pr["phase"] != "queued" and pr["step"] > 0
 
 
 def test_parallel_execute(tmp_path):

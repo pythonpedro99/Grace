@@ -46,20 +46,25 @@ def _label(c: Cfg) -> str:
     return f"{c.arm} seed={c.seed} D={c.D}" + (f" [{c.tag}]" if c.tag else "")
 
 
+def _progress_writer(odir):
+    """on_step(step, phase) writing <odir>/progress.json, throttled: every 25 steps, and at every phase change."""
+    odir.mkdir(parents=True, exist_ok=True)
+    pf, tmp, last = odir / "progress.json", odir / "progress.tmp", [-100, ""]
+
+    def on_step(step, phase):
+        if phase != last[1] or step - last[0] >= 25:
+            tmp.write_text(json.dumps({"step": step, "phase": phase}))
+            os.replace(tmp, pf)  # atomic: the parent never reads half a file
+            last[:] = [step, phase]
+    return on_step
+
+
 def _work(cfg: Cfg, out) -> float:
     """One run in a worker process. Progress goes to <run_id>/progress.json (polled by the
     parent), the eval lines to <run_id>/log.txt."""
     torch.set_num_threads(2)  # several workers share the CPU (data sampling, small ops)
     odir = Path(out) / cfg.run_id
-    odir.mkdir(parents=True, exist_ok=True)
-    pf, tmp, last = odir / "progress.json", odir / "progress.tmp", [-100, ""]
-
-    def on_step(step, phase):  # throttled: every 25 steps, and at every phase change
-        if phase != last[1] or step - last[0] >= 25:
-            tmp.write_text(json.dumps({"step": step, "phase": phase}))
-            os.replace(tmp, pf)  # atomic: the parent never reads half a file
-            last[:] = [step, phase]
-
+    on_step = _progress_writer(odir)
     t = time.time()
     with open(odir / "log.txt", "a") as f:
         def log(line):
@@ -102,7 +107,10 @@ def execute(cfgs, out, workers: int = 1, progress: bool = True) -> None:
             for i, c in enumerate(todo, 1):
                 t = time.time()
 
-                def on_step(step, phase, c=c):
+                write = _progress_writer(Path(out) / c.run_id)  # progress.json also here, so analysis.progress sees a background run
+
+                def on_step(step, phase, c=c, write=write):
+                    write(step, phase)
                     advance(c, step)
                     bar.set_postfix_str(f"run {i}/{len(todo)}: {c.arm} s{c.seed} {phase}",
                                         refresh=False)
