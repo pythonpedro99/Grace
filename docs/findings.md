@@ -211,7 +211,48 @@ with a **decoded-prediction term** (`Cfg.dp_weight`: `||D(P(z_ctx, a)) − x_nex
 content-agnostic reconstruction is faded (idea 3, `gaf/fork.py`), read by decoders, the latent's variance shares (`readout.variance_shares`) and a timeline
 over the checkpoints. **Fork design:** one plain `joint` parent (20k, the availability stage); every arm is a fork of its checkpoint that introduces dp
 (`joint_fork(dp=…)`, cross-faded in over the fade): `continue`, `continue + dp`, `fade`, `fade + dp`, `fade-r0 + dp`, `dp only` (reconstruction off and dp on at
-once). So dp's effect is not confounded with the warmup, and `dp only` starts from available content. Not run yet.
+once). So dp's effect is not confounded with the warmup, and `dp only` starts from available content. Results in §8c.
+
+## 8c. The decoded prediction in forks (`08_joint_dp.ipynb`; one `joint` parent at 20k, six forks of 12k steps, 4k of them the schedule, seed 0)
+
+**Status:** six forks read with the model's own decoder on the real next frame (`own`), the decoded predicted frame (`pred`) and the latent (variance share, rank).
+**The fresh-decoder readout is not run yet**, so every "holds" verdict below is provisional (the own decoder can stop reading content it no longer decodes, see 3).
+The target-gradient fork (`fade-r0 + dp + tgt`) is prepared and not run. Single seed.
+
+Parent at 20k reproduces notebook 07 (predicted move-step facing 0.69, agent 0.73, hand 0.38; twinkle held 0.89 own; rank 98).
+
+| fork | own: agent / facing / mob / terrain | own: twinkle | pred: facing (move) / hand / mob | rank |
+|---|---|---|---|---|
+| parent | 0.97 / 0.96 / 0.63 / 0.81 | 0.89 | 0.69 / 0.38 / 0.20 | 98 |
+| `continue` | 0.99 / 0.99 / 0.83 / 0.90 | 0.93 | 0.83 / 0.42 / 0.32 | 104 |
+| `continue + dp` | 0.98 / 0.99 / 0.85 / 0.92 | 0.87 | 0.95 / 0.63 / 0.54 | 104 |
+| `fade` (control) | 0.86 / 0.76 / 0.04 / 0.61 | 0.74 | 0.62 / 0.37 / −0.02 | 105 |
+| `fade + dp` | 0.89 / 0.81 / 0.71 / 0.87 | 0.22 | 0.94 / 0.66 / 0.60 | 104 |
+| `fade-r0 + dp` | 0.74 / 0.48 / 0.71 / 0.86 | −0.01 | 0.98 / 0.64 / 0.61 | 104 |
+| `dp only` | 0.77 / 0.53 / 0.71 / 0.86 | −0.01 | 0.97 / 0.64 / 0.62 | 104 |
+
+1. **H1 holds: the decoded prediction improves the dynamics, by itself.** `continue + dp` against `continue`: predicted move-step facing 0.95 against 0.83, hand 0.63
+   against 0.42, mob 0.54 against 0.32, agent 0.96 against 0.86. This is the largest effect in the table and it needs no fade.
+2. **H4 holds: the plain fade erodes.** Own decoder: mob 0.63 → 0.04, terrain 0.81 → 0.61, facing 0.96 → 0.76, agent 0.97 → 0.86; the noise is only partly released (0.89 → 0.74).
+   The predicted mob goes to −0.02. The problem of notebook 07 reproduces.
+3. **The decoded prediction stops the erosion and releases the noise, but not on every part.** `fade + dp` keeps hand (0.96), inventory (0.99), terrain (0.87) and
+   the mob (0.71, against 0.04 in the control), releases the twinkle (0.89 → 0.22) and has the best dynamics. It does **not** hold agent (−0.08) and facing (−0.15)
+   by the own decoder, missing the 0.05 rule. The strict versions (`fade-r0 + dp`, `dp only`) release the twinkle completely (−0.01) and read agent 0.74–0.77 and
+   facing 0.48–0.53, while their predicted move-step facing is 0.97–0.98. **Facing is predicted at the ceiling and not decodable from the real next latent**: a decoder that only ever
+   sees predictions (reconstruction 0) can stop reading the real latent. Whether the content is in the latent is the fresh decoder's question, not answered yet.
+4. **H2 (`dp only`):** a (noise released) yes; b (holds learned content) not by the own decoder, open; **c (the price) the opposite**: mob and terrain are *higher* than in the parent
+   (0.71 and 0.86 against 0.63 and 0.81), not lower. The decoded prediction made them available as the predictor learned them.
+5. **`dp only` equals `fade-r0 + dp`** on every readout, so the 4k cross-fade does not matter and the simpler switch is enough.
+6. **H5 fails: release does not follow the parent's prediction skill** (Spearman −0.31 against the rule −0.5; without twinkle +0.20). Release is binary: the twinkle goes (0.67–0.90),
+   everything else stays, the mob included although the parent predicted it at 0.20. What counts is the predictor at the **end** of the fork: the mob's predicted score rises
+   0.20 → 0.60 during it, because the decoded prediction keeps the predictor learning. The detail level is set by what the predictor has learned by the end, not at the fade's start.
+7. **Rank does not collapse** (98 → 104 in every fork). **The twinkle's variance share is 0.00 in every run** (including the parent, where it is held at 0.89), so it carries no information here:
+   low amplitude is not selective (facing and hand are as quiet), and the vote counts only the two decoder instruments.
+
+**Conclusion.** The decoded prediction does what it was built for: the learned content that the fade eroded (mob, terrain, hand) is kept, the unpredictable twinkle goes, and the dynamics
+get clearly better. The cost is on agent and facing under a strict fade, which the own decoder reports as lost and the predictor as perfectly foreseen. The one open measurement decides it:
+the fresh decoder on parent, `fade`, `fade + dp` and `fade-r0 + dp`. If facing and agent are in the latent there, the recipe (warm up with reconstruction, then switch to the decoded prediction) works, and
+`dp only` is the simplest form of it.
 
 ## 9. Revised beliefs
 
@@ -223,7 +264,7 @@ once). So dp's effect is not confounded with the warmup, and `dp only` starts fr
 | noise gets worse with training | twinkle peaks at about 40k, then decays |
 | the live rank collapses because SIGReg at 0.01 is too weak | the open target path collapses it; SIGReg 0.01 keeps full rank without it |
 | the open path removes noise | retention release removes noise; the open path does not |
-| a decoded prediction loss is the fix for dynamics | it helped a pretrained predictor; from scratch the residual predictor with latent loss did better; nothing got close |
+| a decoded prediction loss is the fix for dynamics | it helped a pretrained predictor; from scratch the residual predictor with latent loss did better; nothing got close. In the joint model's forks it is the largest gain: predicted move-step facing 0.83 → 0.95, hand 0.42 → 0.63, mob 0.32 → 0.54 (§8c) |
 | the live encoder does not earn its cost | its latent is about 5× more predictable, a geometry the dynamics need |
 | κ ≈ 1.5 is universal | κ is model-dependent (about 0.56 for `ae` at D 32) |
 | crops raise a class's mass | spatial crops do not raise the mass of uniformly spread classes |
@@ -252,8 +293,8 @@ latent predictable**. B joins them only by a linear readout, so neither latent h
 
 ## 11. Open questions, in order
 
-1. **The leaves in the joint model** (`08_joint_dp.ipynb`): the decoded-prediction term alone (idea 2) and as the consolidation of a faded reconstruction
-   (idea 3), with pre-registered expectations. The joint arm itself is run (section 8b).
+1. **The fresh decoder on the 08 forks** (parent, `fade`, `fade + dp`, `fade-r0 + dp`): is facing / agent in the latent after the strict fade (§8c, 3)? Then the target-gradient fork
+   (`fade-r0 + dp + tgt`, E1-E3 in the notebook) and a second seed.
 2. **Terrain and mob in the latent:** an unweighted decoder readout, and a softer class-weight cap.
 3. **An independence-based noise criterion** against the current release rule.
 4. **Seeds.** Above all the floor-and-open-path interaction and the joint arm.
