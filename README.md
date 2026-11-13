@@ -249,6 +249,7 @@ One run: `python -c "from gaf.train import Cfg, run; run(Cfg(arm='both'), 'resul
       06_b_mechanism.ipynb       what removes the hand, holds the noise, collapses the rank
       07_joint.ipynb             the joint model: warmup (reconstruction + prediction), fade, prediction-distillation anchor
       08_joint_dp.ipynb          leaves in the joint model: one plain joint parent, six forks introducing the decoded-prediction term
+      09_final_model.ipynb       the final model as a decision tree: stage-2 weights, SIGReg, label-free stage-1 weights, reconstruction weight, then seeds and 40k
     results/         downloaded results, one folder per notebook (git-ignored)
     docs/findings.md   everything learned so far, with the numbers, the corrections and the open questions
 

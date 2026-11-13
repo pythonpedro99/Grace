@@ -212,6 +212,6 @@ real frame and a target gradient (judgement and consolidation). It holds what th
 | world | `gaf/env_grid.py` (`agent_shape`, `mob_mode`, `mob_chase`, `hand_tiles`, `variants()`) |
 | objectives | `gaf/train.py` (arms, `rec_class_power`, `rec_class_cap`, `dp_weight`), `gaf/fork.py` (`dp`, `tgt`, `gate`, `r_floor`) |
 | readouts | `gaf/readout.py`: `dynamics`, `decoder_strength(matched=True)`, `action_test`, `variance_shares` |
-| notebooks | `notebooks/01`–`08`, numbered in order; the joint model and its forks are `07_joint`, `08_joint_dp` |
+| notebooks | `notebooks/01`–`09`, numbered in order; the joint model and its forks are `07_joint`, `08_joint_dp`; `09_final_model` is the replication and label-free study (not yet run) |
 | results | `results/<notebook>/`; `results/joint_dp/` holds every fork's checkpoint, `readouts.json`, and the saved tables (`readouts_all.csv`, `gate_readouts.csv`, `action_test.csv`, `mob_position.csv`) |
 | earlier method | `docs/reference_gated_retention.md` (B) |

@@ -153,6 +153,7 @@ class Cfg:
     # so this term asks for nothing but what can be predicted. With shadow_rec = 0 it is the only reconstruction-like term (reconstruct only
     # what can be predicted); with shadow_rec > 0 it adds to the content-agnostic reconstruction, which can then be faded (fork.py) while this stays.
     dp_weight: float = 0.0
+    rec_focal: float = 0.0  # label-free error weighting of the reconstruction (rec_error focal); 0: off
     rec_class_cap: float = 30.0  # class weights are clamped to [1/cap, cap] before normalising: a smaller cap keeps terrain and mob from being zeroed
     pred_arch: str = "mlp"  # predictor (and the shadow's): "mlp" or "film" (models.FiLMPredictor: residual, action-gated)
     ret_floor_all: bool = False  # the unconditional floor: every direction keeps a retention weight of at least ret_w_min
@@ -178,7 +179,7 @@ class Cfg:
 _LATE_FIELDS = {"head_start": 0, "early_eval": (), "shadow_rec": 1.0, "ret_lam": 1.0,
                 "ret_every": 50, "ret_tau": 0.995, "ret_lag": 0.999, "ret_eps_g": 0.02,
                 "ret_eps_f": 0.1, "rec_diff": False, "lam_diff": 0.0,
-                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "rec_class_cap": 30.0, "dp_weight": 0.0, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
+                "rec_class_power": 0.0, "rec_clusters": 0, "rec_pos_types": 6, "eval_parts": 0, "eval_parts_steps": 400, "ret_ac": 0.0, "ret_w_min": 0.3, "ret_floor_all": False, "pred_arch": "mlp", "rec_class_cap": 30.0, "dp_weight": 0.0, "rec_focal": 0.0, "log_mech": 0, "ckpt_every": 0, "settle_window": 0, "settle_min_steps": 15_000,
                 "settle_patience": 2, "settle_tol_change": 0.05, "settle_tol_swing": 0.1}
 _LATE_ENV_FIELDS = {"swap_colors": False, "hand_tiles": 1, "compass_tiles": 0, "hand_p": 1.0,
                     "hand_contrast": 1.0, "agent_shape": "marker", "mob_mode": "jump", "n_mobs": 1, "mob_chase": 0.7}
@@ -296,15 +297,29 @@ def is_settled(rows, window, min_steps, tol_change=0.05, tol_swing=0.1) -> bool:
     return True
 
 
-def rec_error(x_hat, x, cls=None, w=None, tile=None):
+FOCAL_CAP = 20.0  # an error-weighted tile counts at most this many times the mean
+
+
+def rec_error(x_hat, x, cls=None, w=None, tile=None, focal=0.0):
     """Mean squared reconstruction error per pixel and channel; with class weights w (per tile class), each tile's error is
-    weighted by w[its class]. x, x_hat: (..., 3, res, res); cls: (..., tiles) with tiles = (res / tile)^2."""
+    weighted by w[its class]. x, x_hat: (..., 3, res, res); cls: (..., tiles) with tiles = (res / tile)^2.
+    focal > 0 (label-free): each tile's error is also weighted by (its error / the mean tile error) ** focal, with a stop-gradient and
+    mean weight 1 (capped at FOCAL_CAP): tiles that are still badly reconstructed count more, so small content that a plain MSE would
+    leave unlearned is pulled in, per sample, with no class labels and no assumption about where it sits. It is an L_(1+focal) loss over
+    the tiles. Irreducible noise keeps a high error and is up-weighted as well (the gate and the target gradient of stage 2 remove it)."""
     e = (x_hat - x) ** 2
-    if w is None:
+    if w is None and focal <= 0:
         return e.mean()
     side = x.shape[-1] // tile
     per_tile = e.view(*e.shape[:-3], 3, side, tile, side, tile).sum((-5, -3, -1)).flatten(-2)  # (..., tiles)
-    return (per_tile * w[cls]).sum() / (cls.numel() * 3 * tile * tile)
+    if w is not None:
+        per_tile = per_tile * w[cls]
+    if focal > 0:
+        with torch.no_grad():
+            fw = (per_tile / per_tile.mean().clamp_min(1e-12)).clamp_min(1e-3) ** focal
+            fw = (fw / fw.mean()).clamp(max=FOCAL_CAP)
+        per_tile = per_tile * fw
+    return per_tile.sum() / (per_tile.numel() * 3 * tile * tile)
 
 
 def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
@@ -371,7 +386,7 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         shadow=shadow if use_ret else None, dec=dec if use_ret else None, ref=ref if use_ret else None,
         Rh=Rh if use_ret else None, ae_dec=ae_dec if use_ae else None,
         ae_rec=((lambda clip, zc, zt: rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, tile_cls(clip), cls_w,
-                                                cfg.env.tile if cls_w is not None else None)) if use_ae else None))
+                                                cfg.env.tile if cls_w is not None or cfg.rec_focal > 0 else None, cfg.rec_focal)) if use_ae else None))
 
     def save_dirs():
         np.savez(odir / "dirs.npz", step=np.array([r["step"] for r in rows]),
@@ -415,7 +430,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
         L = (p - zt_d).pow(2).mean()  # (1/D) sum_j L_j: LeWM's MSE scale
         dp = None
         if use_ae and cfg.dp_weight > 0:  # the predictor's output decoded against the real next frame
-            dp = rec_error(ae_dec(p), xt, tile_cls(clip)[:, -1], cls_w, cfg.env.tile if cls_w is not None else None)
+            dp = rec_error(ae_dec(p), xt, None if cls_w is None else tile_cls(clip)[:, -1], cls_w,
+                           cfg.env.tile if cls_w is not None or cfg.rec_focal > 0 else None, cfg.rec_focal)
             acc["dp"].append(dp.item())
         with torch.no_grad():
             gate.update(gate.per_dir(p - zt_d), gate.per_dir(P_lag(zc.detach(), a) - zt_d))
@@ -426,8 +442,8 @@ def run(cfg: Cfg, out, verbose: bool = True, on_step=None, log=print) -> dict:
             sig = sig + cfg.lam_diff * sigreg((z_all[:, 1:] - z_all[:, :-1]).transpose(0, 1), cfg.n_slices)
         enc_aux = sig  # what shapes the encoder besides the prediction paths: SIGReg (+ retention, + reconstruction)
         if use_ae:  # reconstruction of every frame from its latent; the encoder gets it through z_c and z_t
-            rec = rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, tile_cls(clip), cls_w, cfg.env.tile
-                            if cls_w is not None else None)
+            rec = rec_error(ae_dec(torch.cat([zc, zt[:, None]], 1)), clip.x, None if cls_w is None else tile_cls(clip), cls_w,
+                            cfg.env.tile if cls_w is not None or cfg.rec_focal > 0 else None, cfg.rec_focal)
             enc_aux = enc_aux + cfg.shadow_rec * rec
             gD = torch.autograd.grad(cfg.shadow_rec * rec + (cfg.dp_weight * dp if dp is not None else 0.0), list(ae_dec.parameters()),
                                      retain_graph=True)

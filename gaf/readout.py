@@ -103,12 +103,17 @@ def dynamics(run_dir, n_eval: int = 2048, step=None) -> pd.DataFrame:
     return pd.DataFrame(rows).T
 
 
-def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int = 256, step=None, matched: bool = False) -> pd.DataFrame:
+def decoder_strength(run_dir, steps: int = 5000, n_eval: int = 2048, batch: int = 256, step=None, matched: bool = False, weights=None) -> pd.DataFrame:
     """Freeze each encoder of the checkpoint, train a fresh decoder (class-weighted pixel loss, as the shadow) on its latent and decode
     held-out frames. Note: with the default class weights (cap 30) terrain and mob are down-weighted, so this under-reads those two;
-    matched=True trains the decoder with the checkpoint's own weights (its rec_class_power and rec_class_cap), as the model was trained."""
+    matched=True trains the decoder with the checkpoint's own weights (its rec_class_power and rec_class_cap), as the model was trained.
+    weights=(power, cap): the same fixed evaluation weights for every checkpoint (the labels are used only to read, so label-free models
+    are compared with one instrument)."""
     ck = load(run_dir, step)
-    w, _ = class_weights(ck.env, ck.c.rec_class_power, cap=ck.c.rec_class_cap) if matched else class_weights(ck.env, 1.0)
+    if weights is not None:
+        w, _ = class_weights(ck.env, weights[0], cap=weights[1])
+    else:
+        w, _ = class_weights(ck.env, ck.c.rec_class_power, cap=ck.c.rec_class_cap) if matched else class_weights(ck.env, 1.0)
     ev = ck.env.sample(n_eval)
     score, rows = _scorer(ck, ev), {}
     for name, (E, _, _) in systems(ck).items():

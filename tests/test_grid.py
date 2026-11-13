@@ -570,3 +570,38 @@ def test_fork_prediction_gated_reconstruction(tmp_path):
     m0 = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="nog", dp=1.0, log_every=5, verbose=False) / "metrics.csv")
     assert "gate_rec" not in m0.columns
     assert m0["gate_r"].eq(0.0).all()
+
+
+def test_rec_error_focal_is_label_free_and_weights_hard_tiles():
+    from gaf.train import rec_error
+    torch.manual_seed(0)
+    x = torch.zeros(4, 3, 8, 8)
+    x_hat = x.clone()
+    x_hat[:, :, 0:4, 0:4] += 0.5  # one wrong tile per frame (tile 4 -> 2 x 2 tiles)
+    plain = rec_error(x_hat, x)
+    focal0 = rec_error(x_hat, x, None, None, 4, focal=1e-9)
+    focal = rec_error(x_hat, x, None, None, 4, focal=1.0)
+    assert abs(plain.item() - focal0.item()) < 1e-6  # focal -> 0 is the plain error
+    assert focal.item() > plain.item()  # the hard tile counts more than its share
+    x_hat.requires_grad_(True)
+    rec_error(x_hat, x, None, None, 4, focal=1.0).backward()  # the weights are constants, the loss is differentiable
+    assert x_hat.grad.abs().sum() > 0
+
+
+def test_fork_without_weights_and_sigreg_override(tmp_path):
+    """weights=False: plain pixel error in every reconstruction-like term; lam=0: SIGReg out of the loss (still logged)."""
+    import pandas as pd
+
+    from gaf import fork as F
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    cfg = Cfg(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=128, mlp_n=256,
+              mlp_steps=5, lam=0.01, rec_class_power=1.0, rec_class_cap=4.0, pred_arch="film", ckpt_every=10, rec_focal=1.0)
+    run(cfg, tmp_path, verbose=False)  # the parent itself trains with the error weighting
+    d = tmp_path / cfg.run_id
+    m = pd.read_csv(F.joint_fork(d, "fade", steps=10, fade=10, r_floor=0.0, tag="nw", dp=1.0, gate=0.02, tgt=1.0, weights=False, lam=0.0,
+                                 log_every=5, verbose=False) / "metrics.csv")
+    assert m["sigreg"].iloc[-1] > 0  # logged although it is not in the loss
+    assert "gate_rec" in m.columns
+    s = json.loads((d / "forks" / "fade-nw" / "summary.json").read_text())["fork"]
+    assert s["weights"] is False
+    assert s["lam"] == 0.0
