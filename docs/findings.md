@@ -1,428 +1,217 @@
-# Findings: availability, retention and dynamics in the grid world
+# Findings: keeping what a world model can learn, releasing the rest
 
-**Status:** working notes, November 2026. Everything below comes from one synthetic world (the Craftax-shaped grid world, `gaf/env_grid.py`),
-mostly **one seed**, runs of 5k–100k steps. Numbers are the readouts at the stated step. Treat single-seed results as directions, not results.
-Section 7 lists the beliefs that were later revised.
+**Status.** Working notes, November 2026. All results come from one synthetic world (the Craftax-shaped grid world, `gaf/env_grid.py`) and, unless
+stated, **one seed**. Read every number as a direction. Content is measured with decoders, not probes (§8). Pre-registered rules are in the notebooks.
 
-**Goal:** a self-supervised world model that keeps the content Craftax needs (inventory, the faced tile, mobs, the agent) where LeWM-style JEPAs
-lose it ("race and prune": the prediction loss deletes content the predictor has not learned yet), first understood in the grid world, then
-tested on Craftax (the AAC repo).
+## Summary
 
----
+LeWM-style JEPAs lose small, moving or rare content (Craftax: mobs, ores, the faced tile). We asked what an objective must do so that a latent
+**holds everything its predictor can learn within its budget and releases the rest**, while staying predictable. Five steps answered most of it:
 
-## 1. Setup in brief
+1. **Availability comes first.** What an encoder holds follows the content's share of pixel variance and whether it sits at a fixed place. Prediction
+   plus SIGReg alone holds almost nothing; reconstruction holds what has enough pixel mass, and class-balanced weights extend that to small and moving content.
+2. **A separate reconstruction encoder (B) cannot protect content**, because its release rule ("the predictor cannot predict it") does not separate
+   *not yet learned* from *unlearnable*. Hard but real content is released like noise.
+3. **One encoder with reconstruction and prediction (`joint`) holds the content and shapes it for dynamics**, but it also holds the noise, and fading the
+   reconstruction erodes everything.
+4. **A decoded-prediction term** (`||D(P(z, a)) − x_next||`) **keeps what the predictor learned, releases the noise and improves the dynamics** under a
+   fade. It loses exactly one thing, the agent's facing, because the predictor can draw the facing from the action without the latent holding it.
+5. **A reconstruction of the real frame, weighted per tile by how well the predictor foresaw it (`gate`), closes that gap.** With a target gradient on
+   top, the model holds all learned content, releases the noise completely and keeps the best dynamics.
 
-**Grid world.** 48×48 frames: a 12×8 random map (floor, wood, stone, water; a new map per clip) and 4 HUD rows. Clips of 3 frames, 5 actions.
-
-| entity | what it is | kind | pixel mass |
-|---|---|---|---|
-| hand | the material in front of the agent, in a HUD tile | fixed place, depends on position, facing and map | 0.88 % per tile |
-| inventory | 16 HUD slots, 10 levels, slow random walk | fixed place, slow | 1.24 % per slot |
-| agent position | where the agent stands | moving, slow | ~10 % (agent tile) |
-| facing | marker on the agent (`agent_shape="marker"`) or the agent's arrow silhouette (`"arrow"`) | moving, fast, action-driven | 3.0 % (marker), 4.3 % (arrow) |
-| mob | jumps randomly (`mob_mode="jump"`, noise) or chases the agent (`"chase"`, predictable) | moving | 3.7 % |
-| twinkle | 4 floor cells with fresh random brightness every frame | noise | 3.2 % |
-
-Pixel mass = the share of the dataset's pixel variance a component explains (`component_masses`).
-
-**Arms** (`gaf/train.py`): `sg`, `lewm`, `ema` (JEPA baselines), `detached` (SIGReg only), `ae` (reconstruction + SIGReg), `retain` /
-`retain_open` = **B**: a shadow encoder (reconstruction + SIGReg, never shaped by prediction) whose content a reference map asks the live encoder
-to keep (`docs/reference_gated_retention.md`), `retain_open` adding the floor-gated open target path. `joint` (new): one encoder with
-reconstruction + prediction + SIGReg.
-
-**Readouts.** Ridge and MLP probes per part (`pm_*`), mechanism diagnostics (`gaf/mech.py`), and decoder-based readouts (`gaf/readout.py`).
-**Probes under-read compressed latents** (section 6), so content claims should rest on decoders.
+Open: the mob (poorly localised by every model, the instruments disagree), seeds, capacity pressure, label-free weights and transfer to Craftax.
 
 ---
 
-## 2. The pixel mass law (`04_mass_law.ipynb`, D = 32 unless stated)
+## 1. Question and setup
 
-1. **What an encoder holds follows the content's share of pixel variance.** Hand readout for 1/2/4/8/16 hand tiles (0.88–12.5 %):
-   - `ae` (reconstruction): −0.09 / 0.50 / 0.98 / 0.96 / 0.98, crossing 0.5 at about 1.75 % (mass × D ≈ 0.56);
-   - `detached` (SIGReg only): never (0.25 at 12.5 %).
-2. **D lowers the threshold for reconstruction, not for SIGReg alone.** `ae` crossing: 1.75 % (D 32), 0.40 % (D 64), 0.34 % (D 128), so
-   not a clean 1/D. `detached` has no crossing at any D. The threshold κ is model-dependent, not universal.
-3. **Frequency trades for size at equal mass.** At 1.75 %, readouts were 0.50 / 0.49 / 0.42 / 0.42.
-4. **Location is a barrier.** The facing shown at a fixed place (a compass HUD tile, 3.3 %) is held at 0.96; the moving marker (3.0 %) at
-   −0.08. Fixed-place content (hand, inventory) is held, moving content (agent position at 10 %, mob, marker) is not.
-5. **Class-balanced reconstruction moves the line.** Each tile's error is weighted by its ground-truth class share of variance to the
-   power −1, capped at 30×.
-   - It lifts the hand at 0.88 % from −0.09 to 0.92–0.94 and the agent position from −0.1 to 0.72–0.75.
-   - It costs inventory (0.78 → 0.30–0.44 at D 32).
-   - Facing marker, mob and twinkle stay at about 0. Power 0.5 is worse.
-6. **Class weights have a side effect:** terrain is pushed to the lower cap (weight about 0.03) and the mob to about 0.19. The weighted shadow's
-   own decoder never reconstructs either (section 6).
-7. **Label-free class weights** (`rec_clusters`, `rec_pos_types`): k-means on tile pixels alone fails, because a hand tile looks exactly like a
-   map tile (92–97 % of hand tiles land in terrain clusters). Adding a position type from each position's change rate (hand 47 %, map 3 %)
-   recovers weights close to the ground truth (hand about 30× the map weight). Twinkle is over-weighted about 5× (no predictability guard).
-   Not yet tested in B.
+**Question.** A JEPA deletes content its predictor has not learned yet ("race and prune"). Can an objective make content **available** first, let
+the predictor learn, **judge** what was learned, and then **consolidate** that and release the rest?
 
-Earlier context (`03_sigreg_mass.ipynb`): in the clip world a sprite is held by SIGReg alone only at about 7.7 % pixel share. Scaling the
-whole frame changes nothing (relative share matters). SIGReg on latent differences does not recover sprites. In the grid world, the JEPA
-baselines' latent is about 70–90 % the random map and holds nothing labelled.
+**World.** 48×48 frames: a random 12×8 map per clip (floor, wood, stone, water) and 4 HUD rows; clips of 3 frames; 5 actions (no-op, 4 moves).
 
-## 3. B at D = 128 (`05_b_d128.ipynb`; arrow agent, chasing mob, hand at 1 tile)
-
-Final strong probe, live encoder:
-
-| run | hand | position | inventory | facing | mob | twinkle | rank |
-|---|---|---|---|---|---|---|---|
-| plain B, 15k | 0.91 | −0.23 | 0.93 | −0.18 | −0.21 | 0.81 | 90 |
-| plain B, 30k | 0.96 | −0.22 | 0.96 | −0.19 | −0.22 | 0.84 | 102 |
-| weighted B, 15k | 0.07 | 0.96 | 0.76 | 0.08 | −0.12 | 0.24 | 46 |
-| weighted B, 30k | 0.00 | 0.96 | 0.82 | 0.09 | −0.10 | 0.55 | 46 |
-| `sg` (no shadow), 15k | −0.10 | −0.10 | −0.09 | −0.11 | −0.12 | −0.11 | 56 |
-
-- **`sg` at D = 128 holds nothing**, so what B holds is B's doing, not D's.
-- **The weighted run's live encoder loses the hand while its shadow keeps it** (shadow 0.90–0.93).
-- **The plain run also loses the hand, just later.** 100k runs read at 65k with the 12k-clip eval probe:
-  - Plain: hand 0.86 at 50k, then 0.25 at 65k, exactly as the mean retention weight falls to 0.09 (93 of 128 directions free) and the
-    gate set empties (`n_S` → 0). Twinkle falls 0.85 → 0.71 over the same window.
-  - Weighted: settled by 65k at hand 0.00, position 0.97, inventory 0.92 and facing 0.05 (probe). Twinkle peaks at 0.55 (40k) and decays
-    to 0.41. Live rank 26 against the shadow's 121.
-- **Diagnosis from the logs:** the shadow predictor cannot predict the hand (`sh_pred_r2_hard` 0.02 → 0.09 over 30k steps;
-  `ref_rho_hard` 0.03–0.16). The reference map treats it as noise and releases it.
-- **The plain run is a natural experiment.** At about 6k its retention weight dips and the live hand dips (0.65 → 0.30). When the weight
-  re-engages, the hand recovers (0.73 by 10k).
-
-## 4. The mechanism stage (`06_b_mechanism.ipynb`; 2×2 at 15k, class-weighted)
-
-Open target path on or off (`retain_open` / `retain`) × retention as is or floor on all (`ret_floor_all`, every direction keeps weight ≥ 0.3).
-
-| | live hand (final probe) | live rank | shadow hand |
+| content | what it is | kind | pixel mass |
 |---|---|---|---|
-| open on, normal | 0.01 | 39 | 0.93 |
-| open on, floor all | **0.82** | 42 | 0.91 |
-| open off, normal | 0.03 | 113 | 0.89 |
-| open off, floor all | 0.04 | 116 | 0.90 |
+| inventory | 16 HUD slots, slow random walk | fixed place, slow | 1.2 % per slot |
+| hand | the material in front of the agent (HUD tile) | fixed place, depends on position, facing, map | 0.9 % |
+| agent | a white arrow; its orientation is the **facing** | moving; facing set by each move action | ~10 % / 4.3 % |
+| mob | steps toward the agent with p = 0.7, else a random step | moving, partly predictable | 3.7 % |
+| twinkle | 4 floor cells with a new random brightness each frame | **noise** | 3.2 % |
 
-1. **The hand's release is abrupt.** In the normal runs the retention weight on the hand's directions falls from 1.0 at 4k to 0.03 at 6k.
-   The retention head's fit of the hand falls 0.93 → 0.26 (6k) → −0.08 (12k).
-2. **A floor of 0.3 alone does not hold it.** With the open path off, the hand dies between 9k and 12k (head fit 0.60 → 0.00).
-   - Prediction and retention gradients conflict there (cosine −0.45 to −0.52).
-   - The prediction gradient is about twice as large as with the open path on (0.08–0.11 against 0.04–0.08).
-   - Only floor plus open path held it in this seed, and the hand oscillated with the gate state.
-3. **The open target path causes the live rank collapse**, not SIGReg's weight and not retention. Rank is 39–42 with the open path on and
-   113–116 with it off; the shadow is at 119. Within a run, rank falls to 19–22 when the gate protects only about 2 directions.
-   - Live SIGReg reads 2.0–3.4 with the open path on and 1.35 with it off. SIGReg pushes against the open path (gradient cosine −0.28 to −0.84).
-   - SIGReg at 0.01 keeps full rank when the open path is off.
-4. **Noise is held by retention, not removed by the open path.** Live twinkle (decoder) is 0.41–0.47 with the open path on, 0.03 with it off
-   and normal retention, and 0.39 with the floor.
-5. **SIGReg sees rank collapse exactly** (Gaussians at D = 128: 1.05 at full rank, 1.17 at participation ratio 100, 2.85 at 26, 6.6 at 10).
-   At weight 0.01 the price of a collapse to 26 dimensions is only about 0.02, the size of the prediction loss.
+Pixel mass = share of the dataset's pixel variance the content explains. Lag-1 autocorrelation spans 0.998 (inventory) to 0.00 (twinkle).
 
-## 5. Rescue and hold (from `ckpt_10000` of "open off, floor all")
+**Models** (`gaf/train.py`, `gaf/fork.py`). JEPA baselines `sg` / `lewm` / `ema`; `detached` (SIGReg only); `ae` (reconstruction + SIGReg);
+**B** (`retain`, `retain_open`: a reconstruction shadow encoder whose content a reference map asks the live encoder to keep); **`joint`** (one encoder:
+reconstruction + latent prediction + SIGReg, FiLM predictor). Later variants are forks of a `joint` checkpoint with a changed objective (§6, §7).
 
-Training restarted for 1500 steps with one force changed. Shadow and reference map frozen, fresh optimiser, probe with 6000 clips.
+**Readouts** (`gaf/readout.py`). A *fresh decoder* trained on the frozen latent (what the latent holds), the model's *own decoder* on the real next
+latent and on the *predicted* latent (what the model foresees). Scores are the share of the "decode nothing" error removed (1 = perfect); facing and
+positions are accuracies (facing chance 0.25).
 
-| variant | hand | position | inventory | twinkle | rank |
-|---|---|---|---|---|---|
-| before | 0.02 | 0.87 | 0.47 | −0.19 | 115 |
-| continue as is | −0.08 | 0.88 | 0.47 | −0.17 | 117 |
-| retention ×3 | 0.52 | 0.82 | 0.42 | 0.05 | 120 |
-| retention ×10 | 0.70 | 0.79 | 0.39 | 0.16 | 121 |
-| no prediction | 0.53 | 0.79 | 0.38 | 0.16 | 120 |
-| no prediction + retention ×3 | 0.67 | 0.76 | 0.39 | 0.17 | 121 |
+---
 
-- **The hand is outvoted, not irreversibly lost.** Prediction erodes it against a retention weight of 0.3, and capacity is not the limit.
-- **Retention ×3 for 4500 steps holds the hand at about 0.5 but erodes slowly**: 0.56, 0.53, 0.47 at +1.5k, +3k, +4.5k. Position, inventory,
-  rank and noise stay stable. A force balance is fragile.
+## 2. Availability: what an encoder holds follows pixel mass and location
 
-## 6. What the latents hold: decoders against probes
+(`04_mass_law.ipynb`, `03_sigreg_mass.ipynb`; D = 32 unless stated)
 
-**Decoder-strength readout.** A fresh class-weighted decoder on each frozen latent at 15k steps. Each entry is the share of the
-"decode nothing" error removed (1 = perfect). Facing is the orientation accuracy of the decoded agent tile (chance 0.25). Values are live / shadow:
+- **Reconstruction holds content above a mass threshold; SIGReg alone holds none.** The hand is held by `ae` from about 1.75 % pixel mass at D = 32
+  (0.40 % at D 64, 0.34 % at D 128); `detached` never holds it (0.25 at 12.5 %). The JEPA baselines' latent is 70–90 % a function of the random map and
+  holds nothing labelled; `sg` at D = 128 holds nothing either.
+- **Location is a barrier.** The same facing information shown at a fixed HUD place is held (0.96 at 3.3 %), on the moving agent it is not (−0.08 at 3.0 %).
+- **Class-balanced reconstruction moves the line.** Weighting each tile's error by its class's inverse share of variance lifts the hand at 0.9 % from
+  −0.09 to 0.92 and the agent position from −0.1 to 0.72. A high weight cap (30) starves terrain and mob; a cap of 4 lets `ae` hold mob and terrain
+  (own decoder 0.98).
+- **Label-free weights** are possible in principle: tile-appearance clusters fail (a hand tile looks like a map tile), clusters plus a position type
+  from each position's change rate recover weights close to the ground truth, but over-weight the twinkle about 5×. Not yet tested in a model.
+- **Craftax agrees.** With the prediction loss switched off (AAC run A5), mobs and ores are lost exactly as in the LeWM runs; content above about 1.4 %
+  pixel mass is kept, content below 0.35 % is lost. The Craftax failure is an availability failure, not only the race.
 
-| run | hand | agent | inventory | twinkle | facing |
-|---|---|---|---|---|---|
-| open on, normal | 0.18 / 1.00 | 0.88 / 0.91 | 0.77 / 0.80 | 0.41 / 0.68 | 0.85 / 0.95 |
-| open on, floor all | 0.94 / 1.00 | 0.87 / 0.90 | 0.75 / 0.76 | 0.47 / 0.67 | 0.83 / 0.93 |
-| open off, normal | 0.23 / 0.99 | 0.74 / 0.91 | 0.72 / 0.76 | 0.03 / 0.66 | 0.45 / 0.93 |
-| open off, floor all | 0.28 / 1.00 | 0.82 / 0.90 | 0.72 / 0.77 | 0.39 / 0.68 | 0.71 / 0.93 |
+## 3. A separate shadow encoder (B) cannot protect content
 
-- **The facing is in the shadow, and largely in the live encoder.** Every probe read about 0.1 (ridge 0.02, small MLP 0.05, a classification
-  MLP 47 % against the decoder's 95 %; adding the agent's position as input does not help). It appears in the shadow as a sharp transition:
-  - decoder accuracy 0.35 (6k) → 0.56 (9k) → 0.93 (12k) → 0.95 (15k);
-  - agent-tile reconstruction error 0.47 → 0.06;
-  - latent sensitivity to the facing 0.37 → 1.55 (about the same as for position or twinkle).
-- **The hand: probes were right.** Released in three runs, kept by the shadow everywhere.
-- **Mob 0.07–0.09 and terrain −0.05 everywhere**, but this decoder used the class weights (mob 0.19, terrain 0.03), so it under-reads them. The
-  shadow's own decoder never reconstructs either (error flat for 15k steps). So the weighted objective does not ask for them; absence from the
-  latent is not proven.
-- **Eval-time probes under-read**: the held hand reads 0.46 on the 12k-clip eval probe and 0.82 on the final probe, at the same step.
+(`05_b_d128.ipynb`, `06_b_mechanism.ipynb`; D = 128, class-weighted)
 
-## 7. Dynamics: holding is not foreseeing
+- **B releases the hand although its shadow holds it.** The weighted run's live encoder loses the hand within 6k steps (probe 0.07, shadow 0.90); the
+  plain run holds it until about 50k, then loses it (0.86 → 0.25) as the retention weights decay.
+- **The cause is the release rule.** The reference map releases a direction when the shadow's predictor cannot predict it, and that predictor never
+  learns the hand (R² 0.02 → 0.09 over 30k steps). "Not learned yet" and "unlearnable" look the same.
+- **Released content is outvoted, not lost.** Raising the retention weight 3× or 10× from a checkpoint brings the hand back within 1500 steps (0.02 → 0.52 / 0.70),
+  so capacity is not the limit; held by a force balance, it erodes again slowly.
+- **Two side findings.** The floor-gated open target path collapses the live rank (39–42 against 113–116 without it), and noise is held or released by
+  retention, not removed by the open path.
 
-**Shadow + its predictor `Qs` against live + `P`** (from `ckpt_15000`):
-- **The live latent is about 5× more predictable.** Prediction error over variance is 0.08–0.14 against 0.42 for the shadow; copying the last
-  frame gives 0.21–0.30 against 0.72–0.74. Part of that comes from what the live latent dropped.
-- **The shadow holds the action-driven content but does not foresee its change.** Decoded with its own decoder:
+## 4. Holding is not foreseeing; one encoder is needed
 
-| | agent | hand | facing accuracy |
-|---|---|---|---|
-| actual next frame | 0.97 | 1.00 | 0.95–0.97 |
-| predicted | 0.51 | −0.30 | 0.45–0.46 |
-| copy last frame | 0.39–0.40 | −0.21 to −0.35 | 0.40–0.42 |
+(`06_b_mechanism.ipynb`, `07_joint.ipynb`)
 
-**Predictor forks on the frozen shadow** (3000 steps). Values are agent / hand / facing on move steps (ceiling 0.97 / 1.00 / 0.96; copy-last
-0.40 / −0.25 / 0.28):
-- `Qs` at the checkpoint: 0.49 / −0.32 / 0.36;
-- `Qs` continued, latent loss: 0.51 / −0.26 / 0.39 (training time alone barely helps);
-- `Qs` continued, decoded class-weighted pixel loss: 0.71 / −0.58 / 0.59;
-- from scratch, plain MLP, decoded loss: 0.07 / −0.05 / 0.27;
-- from scratch, residual action-gated predictor (`FiLMPredictor`), decoded loss: 0.45 / −0.23 / 0.38;
-- from scratch, `FiLMPredictor`, latent loss: 0.59 / −0.07 / 0.46.
+- **A reconstruction latent holds the action-driven content but is not shaped for dynamics.** The shadow decodes facing at 0.95, but its predictor's
+  predicted facing is 0.45 against 0.40 for copying the last frame; no predictor trained on the frozen shadow came close to the ceiling.
+- **`joint` (reconstruction + prediction in one encoder) holds the content and learns dynamics** no earlier model learned: the predicted hand reaches 0.37
+  against −0.26 for copy-last (the shadow alone: 0.00). Longer training keeps improving the predictions.
+- **But it holds the noise** (twinkle 0.89), and **fading the reconstruction erodes the content** (facing 0.89 → 0.53). A distillation anchor to a frozen
+  snapshot holds the content but stalls further learning.
+- **Theory fits the JEPA side.** LeJEPA's identifiability result (Klindt et al., arXiv 2605.26379) needs latents of similar rates (fastest < 2× slowest);
+  here the ratio is about 4700×, which explains why prediction alone favours slow content.
 
-No predictor gets near the ceiling. The facing, the simplest action effect, stays hard in the shadow's latent. **The reconstruction latent is not
-shaped for dynamics.** The hand's dynamics need the terrain next to the agent, which the weighted shadow probably lacks.
+## 5. The decoded prediction keeps what the predictor learned, except action-determined content
 
-## 8. Theory: when LeJEPA learns a world model (Klindt, LeCun, Balestriero, arXiv 2605.26379)
+(`08_joint_dp.ipynb`; one `joint` parent at 20k steps, forks of 12k steps whose objective changes over the first 4k; matched fresh decoder)
 
-- **Linear identifiability needs Gaussian latents.** Non-Gaussian ones are identifiable only up to a monotone map.
-- **The rates must be close.** Under isotropic transitions all latents are recovered by the joint objective. With different rates, "the fastest
-  latent variable must not be more than twice as fast as the slowest" (`max K < 2 min K`, appendix "The role of isotropic transitions").
-  Otherwise the encoder takes higher harmonics of slow latents before the first harmonic of fast ones.
-- **Our world violates both.** Lag-1 autocorrelation: inventory 0.998, position 0.984, chasing mob 0.983, hand 0.34, facing 0.20, twinkle
-  0.00. The fastest-to-slowest rate ratio is about 4700×. Categorical and bounded latents are not Gaussian. This explains the JEPA path's bias
-  against fast content. It says nothing about the reconstruction shadow.
-- **VICReg** (second-moment whitening) matches SIGReg for Gaussian latents. The theorem needs only whitening of the embedding. For non-Gaussian
-  latents SIGReg is *more* robust than VICReg ("SIGReg's Gaussianization of h is more robust to non-Gaussian latent variable distributions than
-  whitening").
+**The term.** `dp = ||D(P(z_ctx, a)) − x_next||`, the predictor's output decoded and compared with the real next frame. It asks only for what can be
+predicted: noise earns nothing, because no prediction can contain it.
 
-## 8b. The joint model (`07_joint.ipynb`; ground-truth class weights with cap 4, FiLM predictor, D = 128, 20k warmup, seed 0)
-
-- **The softer cap fixed availability.** The shadow alone (`ae`) now holds mob 0.98, terrain 0.98 and twinkle 0.97 (own decoder; fresh decoder
-  mob 0.78, terrain 0.83), against mob 0.07 and terrain −0.05 with cap 30. The earlier "the mob is never learned" was the weights.
-- **Joint against the shadow alone**, same predictor and weights: predicted move-step facing 0.71 against 0.62, agent 0.77 against 0.74, which missed
-  the pre-registered thresholds (+0.15 / +0.10). The joint model **predicts the hand** (0.37 against copy-last −0.26; the shadow alone 0.00; no predictor
-  before got above −0.07). The joint model holds hand 0.98, agent 0.81, facing 0.83 (fresh decoder) and loses part of the mob (own decoder 0.52).
-- **More joint training keeps improving the predictions** (20k more steps: agent 0.78 → 0.92, hand 0.29 → 0.40, facing on move steps 0.73 → 0.88,
-  mob predicted 0.18 → 0.32 against copy-last 0.15, mob content 0.53 → 0.83). It has not plateaued.
-- **Fade (reconstruction 1 → 0.1) erodes**: facing 0.89 → 0.53 (fresh decoder; own decoder 0.98 → 0.83), agent, mob, terrain. **The prediction-distillation anchor**
-  (a frozen snapshot, weight 10) holds all content but **stalls the learning**: its predictions stay at the parent's level while `continue` gains 0.11–0.15.
-  Noise release was ambiguous (twinkle 0.31 → 0.01 by the fresh decoder, 0.88 → 0.78 by the own decoder). So no measured benefit of fade + anchor over
-  continuing.
-- **The joint latent is dominated by slow content** (copy-last error over variance 0.01 against 0.52 for the shadow), so latent MSE is no longer a progress measure.
-- **Instrument caveat:** a fresh decoder of 3000 steps under-reads entangled content (mob, twinkle, facing) relative to the model's own decoder.
-
-**The leaves.** The joint arm does not remove the unpredictable content (twinkle held at 0.83–0.93 by the own decoder, predicted −1.1). Hypothesis: the decoder is a
-consumer with free gain, so the encoder keeps the noise at low amplitude, where it costs almost nothing in the prediction loss. Tested in `08_joint_dp.ipynb`
-with a **decoded-prediction term** (`Cfg.dp_weight`: `||D(P(z_ctx, a)) − x_next||`, class-weighted), as the only reconstruction-like term (idea 2) or kept while the
-content-agnostic reconstruction is faded (idea 3, `gaf/fork.py`), read by decoders, the latent's variance shares (`readout.variance_shares`) and a timeline
-over the checkpoints. **Fork design:** one plain `joint` parent (20k, the availability stage); every arm is a fork of its checkpoint that introduces dp
-(`joint_fork(dp=…)`, cross-faded in over the fade): `continue`, `continue + dp`, `fade`, `fade + dp`, `fade-r0 + dp`, `dp only` (reconstruction off and dp on at
-once). So dp's effect is not confounded with the warmup, and `dp only` starts from available content. Results in §8c.
-
-## 8c. The decoded prediction in forks (`08_joint_dp.ipynb`; one `joint` parent at 20k, six forks of 12k steps, 4k of them the schedule, seed 0)
-
-**Status:** six forks read with the model's own decoder on the real next frame (`own`), the decoded predicted frame (`pred`) and the latent (variance share, rank).
-**The fresh-decoder readout is not run yet**, so every "holds" verdict below is provisional (the own decoder can stop reading content it no longer decodes, see 3).
-The target-gradient fork (`fade-r0 + dp + tgt`) is prepared and not run. Single seed.
-
-Parent at 20k reproduces notebook 07 (predicted move-step facing 0.69, agent 0.73, hand 0.38; twinkle held 0.89 own; rank 98).
-
-| fork | own: agent / facing / mob / terrain | own: twinkle | pred: facing (move) / hand / mob | rank |
-|---|---|---|---|---|
-| parent | 0.97 / 0.96 / 0.63 / 0.81 | 0.89 | 0.69 / 0.38 / 0.20 | 98 |
-| `continue` | 0.99 / 0.99 / 0.83 / 0.90 | 0.93 | 0.83 / 0.42 / 0.32 | 104 |
-| `continue + dp` | 0.98 / 0.99 / 0.85 / 0.92 | 0.87 | 0.95 / 0.63 / 0.54 | 104 |
-| `fade` (control) | 0.86 / 0.76 / 0.04 / 0.61 | 0.74 | 0.62 / 0.37 / −0.02 | 105 |
-| `fade + dp` | 0.89 / 0.81 / 0.71 / 0.87 | 0.22 | 0.94 / 0.66 / 0.60 | 104 |
-| `fade-r0 + dp` | 0.74 / 0.48 / 0.71 / 0.86 | −0.01 | 0.98 / 0.64 / 0.61 | 104 |
-| `dp only` | 0.77 / 0.53 / 0.71 / 0.86 | −0.01 | 0.97 / 0.64 / 0.62 | 104 |
-
-1. **H1 holds: the decoded prediction improves the dynamics, by itself.** `continue + dp` against `continue`: predicted move-step facing 0.95 against 0.83, hand 0.63
-   against 0.42, mob 0.54 against 0.32, agent 0.96 against 0.86. This is the largest effect in the table and it needs no fade.
-2. **H4 holds: the plain fade erodes.** Own decoder: mob 0.63 → 0.04, terrain 0.81 → 0.61, facing 0.96 → 0.76, agent 0.97 → 0.86; the noise is only partly released (0.89 → 0.74).
-   The predicted mob goes to −0.02. The problem of notebook 07 reproduces.
-3. **The decoded prediction stops the erosion and releases the noise, but not on every part.** `fade + dp` keeps hand (0.96), inventory (0.99), terrain (0.87) and
-   the mob (0.71, against 0.04 in the control), releases the twinkle (0.89 → 0.22) and has the best dynamics. It does **not** hold agent (−0.08) and facing (−0.15)
-   by the own decoder, missing the 0.05 rule. The strict versions (`fade-r0 + dp`, `dp only`) release the twinkle completely (−0.01) and read agent 0.74–0.77 and
-   facing 0.48–0.53, while their predicted move-step facing is 0.97–0.98. **Facing is predicted at the ceiling and not decodable from the real next latent**: a decoder that only ever
-   sees predictions (reconstruction 0) can stop reading the real latent. Whether the content is in the latent is the fresh decoder's question, not answered yet.
-4. **H2 (`dp only`):** a (noise released) yes; b (holds learned content) not by the own decoder, open; **c (the price) the opposite**: mob and terrain are *higher* than in the parent
-   (0.71 and 0.86 against 0.63 and 0.81), not lower. The decoded prediction made them available as the predictor learned them.
-5. **`dp only` equals `fade-r0 + dp`** on every readout, so the 4k cross-fade does not matter and the simpler switch is enough.
-6. **H5 fails: release does not follow the parent's prediction skill** (Spearman −0.31 against the rule −0.5; without twinkle +0.20). Release is binary: the twinkle goes (0.67–0.90),
-   everything else stays, the mob included although the parent predicted it at 0.20. What counts is the predictor at the **end** of the fork: the mob's predicted score rises
-   0.20 → 0.60 during it, because the decoded prediction keeps the predictor learning. The detail level is set by what the predictor has learned by the end, not at the fade's start.
-7. **Rank does not collapse** (98 → 104 in every fork). **The twinkle's variance share is 0.00 in every run** (including the parent, where it is held at 0.89), so it carries no information here:
-   low amplitude is not selective (facing and hand are as quiet), and the vote counts only the two decoder instruments.
-
-**Fresh-decoder readout and the target-gradient fork** (re-run of the readouts after the first pass; numbers fresh decoder, 5k steps, own decoder in brackets):
-
-| | agent | facing | hand | twinkle | pred facing (move) / hand / mob | rank |
+| fresh decoder (real latent) | parent | `continue` | `continue + dp` | `fade` | `fade + dp` | `fade-r0 + dp` |
 |---|---|---|---|---|---|---|
-| parent | 0.92 (0.96) | 0.97 (0.96) | 0.98 | 0.76 (0.89) | 0.68 / 0.30 / 0.23 | 98 |
-| `fade` | 0.76 (0.86) | 0.56 (0.77) | 0.99 | 0.48 (0.73) | 0.62 / 0.41 / −0.02 | |
-| `fade-r0 + dp` | 0.75 (0.74) | 0.42 (0.49) | 0.99 | −0.02 (−0.01) | 0.97 / 0.61 / 0.61 | 104 |
-| `fade-r0 + dp + tgt` | **0.87 (0.93)** | **0.87 (0.88)** | 0.99 (own 0.82) | −0.02 (−0.01) | 0.99 / 0.50 / 0.56 | 101 |
+| reconstruction weight at the end | 1 | 1 | 1 | 0.1 | 0.1 | 0 |
+| agent position / facing | 1.00 / 0.99 | 1.00 / 1.00 | 1.00 / 0.99 | 0.97 / 0.64 | 1.00 / 0.84 | 1.00 / **0.57** |
+| hand / inventory / terrain | 0.98 / 0.99 / 0.78 | 0.99 / 0.99 / 0.80 | 0.99 / 0.99 / 0.81 | 0.98 / 0.97 / 0.59 | 0.99 / 0.99 / 0.76 | 0.99 / 0.99 / 0.82 |
+| mob | 0.55 | 0.61 | 0.64 | **0.03** | 0.44 | 0.55 |
+| twinkle (noise) | 0.89 | 0.92 | 0.87 | 0.79 | 0.23 | **−0.02** |
+| predicted facing (move) / hand / mob | 0.67 / 0.34 / 0.22 | 0.83 / 0.43 / 0.29 | **0.95 / 0.61 / 0.55** | 0.64 / 0.41 / −0.03 | 0.94 / 0.63 / 0.60 | 0.97 / 0.62 / 0.62 |
 
-- **The fresh decoder confirms the loss** (H2b, H3 fail by the pre-registered rule): facing −0.28 (`fade + dp`) to −0.55 (strict), agent −0.12 to −0.17, against −0.41 / −0.15 for the plain fade.
-  The mob reads 0.01-0.02 by the fresh decoder in every fork (parent 0.22), so it under-reads entangled content here; the mob verdicts rest on the own decoder.
-- **The target gradient recovers most of the facing** (0.42 → 0.87, agent 0.75 → 0.87) and releases the noise as completely as without it (twinkle −0.02), rank 101, dynamics kept (predicted facing 0.99).
-  E1 (faster release than `fade-r0 + dp`) fails because the release was already complete; E3 (no rank collapse) holds, unlike the open path in notebook 06; E2 (holds) just misses
-  (facing −0.10, own facing −0.08 against 0.05). It is the best strict model so far, and it needs no pixel term beyond the decoded prediction.
-- **Reading (hypothesis, the shuffled-action test is not run):** the facing follows from the actions, so (predictor, decoder) can draw it without the encoder holding it.
-  The "agent" readout is the arrow silhouette, so the agent loss contains the facing. The target gradient pulls the real next latent towards the prediction, which carries the facing, and
-  that puts it back into the latent. The prediction-gated reconstruction (`gate`) is the other candidate for a hold reward on the real latent.
+- **The decoded prediction is the largest gain in dynamics** (`continue + dp` against `continue`: facing 0.95 / 0.83, hand 0.61 / 0.43, mob 0.55 / 0.29).
+- **Under a fade it stops the erosion and releases the noise.** The plain fade loses the mob (0.55 → 0.03) and terrain; with dp both are held, and with
+  no reconstruction at all (`fade-r0 + dp`) the twinkle is fully released.
+- **It loses one thing: the facing** (0.99 → 0.57). The agent's position is intact (1.00), so the loss is the arrow's orientation only.
+- `dp only` (switch at once instead of over 4k steps) matches `fade-r0 + dp` on every readout; the rank never collapses (98 → 104).
+- **Release is binary, not graded by the parent's skill.** The twinkle goes, all learned content stays, including the mob that the parent predicted at
+  only 0.22: the predictor keeps learning during the fork (predicted mob 0.22 → 0.62), so what counts is the predictor at the end.
 
-**Shuffled-action test and the agent split** (`readout.action_test`, own decoder on the saved checkpoints; the predictor's output is decoded and the arrow's orientation read where it is drawn):
+**Why the facing is lost: the action bypass.** The facing after a move is a function of the action, and the predictor receives the last two actions.
+The pair (predictor, decoder) can therefore draw the facing without the encoder holding it. A shuffled-action test on the decoded prediction confirms it:
 
-| | real inputs: facing right (move / no-op) | last action replaced: follows the fed action / the true facing | context latents shuffled (move) | agent position, real next frame / predicted |
-|---|---|---|---|---|
-| parent | 0.59 / 0.94 | 0.59 / 0.25 | 0.34 | 0.99 / 0.83 |
-| `fade` | 0.56 / 0.72 | 0.56 / 0.24 | 0.45 | |
-| `fade + dp` | 0.93 / 0.92 | 0.94 / 0.26 | 0.78 | |
-| `fade-r0 + dp` | 0.97 / 0.84 | **0.97 / 0.25** | **0.93** | **0.99 / 0.98** |
-
-- **The predicted facing is drawn from the action**: in the strict fork the arrow follows whatever last action is fed (0.97) and agrees with the true facing only at chance (0.25);
-  with the context shuffled across clips it stays at 0.93. The parent's predictor is action-driven as well (0.59 follows the fed action = its accuracy), only less accurate.
-- **The agent's position is held** (0.99 by the own decoder on the real next frame, in the strict fork too), so the "agent" loss is the arrow's orientation, as expected from the silhouette.
-- Together with the fresh decoder (real latent: facing 0.42) this is the bypass: the pair (predictor, decoder) can draw the facing from the action, so the decoded prediction is satisfied
-  without the encoder holding it. The remaining link, that this is why the latent loses it, is inferred (the fork with the target gradient restores it); the test in the notebook repeats this on every fork.
-
-**Matched fresh decoder (the decoder trained with the model's own class weights, cap 4; supersedes the fresh numbers above, which used cap 30 and under-read mob and terrain).**
-Fresh decoder on the real latent, 5k steps, all seven runs (seed 0):
-
-| | parent | continue | continue + dp | fade | fade + dp | fade-r0 + dp | dp only |
-|---|---|---|---|---|---|---|---|
-| agent position | 1.00 | 1.00 | 1.00 | 0.97 | 1.00 | 1.00 | 1.00 |
-| facing (orientation) | 0.99 | 1.00 | 0.99 | 0.64 | 0.84 | **0.57** | **0.50** |
-| agent (silhouette R²) | 0.97 | 0.98 | 0.97 | 0.81 | 0.89 | 0.79 | 0.78 |
-| hand | 0.98 | 0.99 | 0.99 | 0.98 | 0.99 | 0.99 | 0.99 |
-| inventory | 0.99 | 0.99 | 0.99 | 0.97 | 0.99 | 0.99 | 0.99 |
-| terrain | 0.78 | 0.80 | 0.81 | 0.59 | 0.76 | 0.82 | 0.81 |
-| mob | 0.55 | 0.61 | 0.64 | **0.03** | 0.44 | 0.55 | 0.51 |
-| twinkle | 0.89 | 0.92 | 0.87 | 0.79 | **0.23** | **−0.02** | **−0.02** |
-| predicted facing (move) / hand / mob | 0.67 / 0.34 / 0.22 | 0.83 / 0.43 / 0.29 | 0.95 / 0.61 / 0.55 | 0.64 / 0.41 / −0.03 | 0.94 / 0.63 / 0.60 | 0.97 / 0.62 / 0.62 | 0.97 / 0.64 / 0.63 |
-
-- **The strict fade (`fade-r0 + dp`, `dp only`) holds everything except the facing's orientation.** Agent position 1.00, hand, inventory, terrain (0.82 against 0.78) and mob (0.55 / 0.51 against 0.55) are held
-  by the fresh decoder; the twinkle is fully released (−0.02 by both decoders). The "agent" loss (0.97 → 0.79) is the arrow's orientation: the position is intact.
-  The earlier worry that the mob is lost was the instrument (cap 30); the plain `fade` does lose it (0.03), and the decoded prediction rescues it (0.55).
-- **The one loss is the facing (−0.42 / −0.49), and it is the content the action determines** (shuffled-action test: the predicted facing follows the fed action at 0.97). `fade + dp` (reconstruction floor 0.1)
-  sits between: facing 0.84, mob 0.44, twinkle 0.23.
-- **Net:** against the pre-registered "holds" rule (agent and facing within 0.05) the strict forks fail only through the facing. If the facing is not needed from the latent alone, the strict fade does what the goal asks:
-  holds what the predictor learned, releases the rest, best dynamics. A consumer that reads the latent without the action history (policy, IDM) needs the facing, and then the target-gradient or gated fork has to restore it.
-
-**The target-gradient fork with the matched decoder** (`fade-r0 + dp + tgt`, fresh decoder): agent 0.94 (parent 0.97), facing **0.95** (0.99; 0.57 without the target gradient), position 1.00, hand 0.99,
-inventory 0.99, terrain 0.80, twinkle −0.02, rank 101, predicted facing 0.99. **The mob falls to 0.29** (parent 0.55; 0.55 without the target gradient; own decoder 0.65, predicted 0.56).
-The fresh-decoder drops of the pre-registered learned content are 0.03 / 0.00 / 0.04 (E2 passes by the fresh decoder; the own decoder's facing drops 0.11, which fails the rule as written). The target gradient pulls the real next latent
-towards the prediction, which carries the facing (restored) and cannot carry the mob's random moves (the mob moves randomly 30 % of the time): the unpredictable part of a stateful entity is pruned as well, the race of the
-LeWM-style target path again. For Craftax, where mobs are stochastic, this is the risk of a target gradient.
-
-**The prediction-gated reconstruction** (`gate`: the real next frame reconstructed again, each tile weighted by exp(-e/tau), e = the tile's per-pixel error of the decoded prediction; matched fresh decoder, seed 0):
-
-| | parent | `fade-r0 + dp` | `+ tgt` | `gate` (0.02) | `gate + tgt` (0.02) | `gate + tgt` (0.005) |
-|---|---|---|---|---|---|---|
-| agent / position | 0.97 / 1.00 | 0.79 / 1.00 | 0.94 / 1.00 | **0.97 / 1.00** | **0.98 / 1.00** | **0.97 / 1.00** |
-| facing | 0.99 | 0.57 | 0.95 | **0.99** | **1.00** | **0.99** |
-| hand / inventory / terrain | 0.98 / 0.99 / 0.78 | 0.99 / 0.99 / 0.82 | 0.99 / 0.99 / 0.80 | 0.99 / 0.99 / 0.82 | 0.98 / 0.99 / 0.82 | 0.99 / 0.99 / 0.82 |
-| mob (fresh / own) | 0.55 / 0.62 | 0.55 / 0.71 | 0.29 / 0.65 | 0.27 / 0.37 | 0.30 / 0.53 | 0.33 / 0.60 |
-| twinkle (fresh) | 0.89 | −0.02 | −0.02 | **0.20** | −0.01 | −0.01 |
-| rank | 97 | 104 | 101 | 104 | 101 | 101 |
-| predicted facing (move) / hand / mob | 0.67 / 0.34 / 0.22 | 0.97 / 0.62 / 0.62 | 0.99 / 0.53 / 0.56 | 0.93 / 0.61 / 0.48 | 0.99 / 0.52 / 0.42 | 0.99 / 0.52 / 0.49 |
-
-- **The gate closes the facing gap** (0.57 → 0.99, agent 0.79 → 0.97), with no target gradient: the hold reward the decoded prediction lacked was a reconstruction on the real latent, restricted to what the predictor foresees.
-  G1 (holds) passes in all three gate forks; G4 passes (facing drop 0.00 against 0.42 for `fade-r0 + dp`).
-- **Noise: the gate alone releases only part** (twinkle 0.89 → 0.20 fresh, 0.15 own; the soft weight leaves about 0.15 of the pressure on the twinkle tiles at tau 0.02). With the target gradient the release is complete (−0.01), at tau 0.02 and 0.005.
-- **`gate + tgt` (tau 0.005) is the first model that holds the facing and agent, keeps hand, inventory and terrain, releases the noise completely, keeps the rank (101) and the dynamics** (predicted facing 0.99, hand 0.52, mob 0.49,
-  slightly below the strict fade's 0.62 / 0.62 and far above the parent's 0.34 / 0.22).
-- **The mob is the open item (G5 fails by the fresh decoder: 0.27-0.33 against 0.55)**, while the own decoder reads it at 0.37-0.60 (parent 0.62). The two readouts disagree, and the mob-position check (own decoder: parent 0.45, strict 0.49, `+ tgt` 0.42; fresh decoder
-  0.20 / 0.00 / 0.00) shows the mob is localised poorly even in the parent, so the fresh-decoder mob difference is not trustworthy. The mob needs its own instrument before it can be judged.
-  The expectation that the gate alone would keep the mob as `fade-r0 + dp` does was wrong by the fresh decoder (0.27).
-
-**Shuffled-action test on every fork (pod run, own decoder on the predicted frame; the arrow's orientation read where it is drawn):**
-
-| | real inputs: right (move / no-op) | last action replaced: follows fed / true | context shuffled: move / no-op |
+| predicted facing (own decoder) | true inputs (move / no-op) | last action replaced: follows fed / true | context latents shuffled (move / no-op) |
 |---|---|---|---|
 | parent | 0.59 / 0.93 | 0.59 / 0.25 | 0.36 / 0.24 |
 | `fade-r0 + dp` | 0.98 / 0.88 | **0.97 / 0.24** | **0.94 / 0.67** |
-| `fade-r0 + dp + tgt` | 0.99 / 0.95 | 0.98 / 0.24 | 0.86 / 0.29 |
-| `gate` | 0.92 / 0.97 | 0.92 / 0.25 | 0.66 / 0.27 |
-| `gate + tgt` | 0.99 / 0.99 | 0.98 / 0.26 | 0.78 / 0.25 |
-| `gate + tgt` (0.005) | 0.99 / 0.98 | 0.99 / 0.24 | 0.82 / 0.28 |
+| `gate + tgt` (§6) | 0.99 / 0.98 | 0.99 / 0.24 | 0.82 / 0.28 |
 
-- **A1 holds in every fork:** with the last action replaced, the predicted facing follows the fed action (0.92-0.99) and agrees with the true facing at chance (0.24-0.26). The predictor draws the facing from the action.
-- **A2 holds for the strict fork (0.94 with the context shuffled) and shows the mechanism:** in `fade-r0 + dp` the facing is drawn from the action *history* even on no-op steps (0.67 with the context shuffled; the earlier action is an input),
-  so the latent never has to hold it. In the gate and target-gradient forks the no-op facing falls to chance (0.25-0.29) when the context is shuffled: the predictor now **reads the facing from the latent**, because the latent holds it.
-- **A3 holds:** the fresh-decoder agent position is 1.00 in every fork, including the ones whose facing is 0.57; the agent loss in the strict fade is the orientation alone.
-- The story, with the three pieces measured: (1) the facing is action-determined and the decoded prediction is satisfied through the action (A1, A2); (2) so once the reconstruction fades, the latent loses it
-  (fresh facing 0.99 → 0.57, position intact); (3) a reconstruction hold restricted to what the predictor foresees (the gate), or a pull of the real latent towards the prediction (target gradient), puts it back,
-  and the predictor then reads it from the latent.
+In every model the predicted facing follows whatever action is fed. In `fade-r0 + dp` it survives shuffled context latents, even on no-op steps (0.67,
+from the earlier action), so the latent never has to hold it, and once the reconstruction is gone it does not.
 
-**Conclusion.** The decoded prediction does what it was built for: the learned content that the fade eroded (mob, terrain, hand) is kept, the unpredictable twinkle goes, and the dynamics
-get clearly better. The cost is on agent and facing under a strict fade, which the own decoder reports as lost and the predictor as perfectly foreseen. The one open measurement decides it:
-the fresh decoder on parent, `fade`, `fade + dp` and `fade-r0 + dp`. If facing and agent are in the latent there, the recipe (warm up with reconstruction, then switch to the decoded prediction) works, and
-`dp only` is the simplest form of it.
+## 6. A hold on the real latent closes the gap
 
-## 9. Revised beliefs
+(`08_joint_dp.ipynb`, same parent; forks from `fade-r0 + dp`)
+
+Two ways to make the real latent carry what the predictor foresees:
+
+- **Target gradient (`tgt`)**: `||sg(P(z_ctx, a)) − E(x_next)||` pulls the real next latent toward the prediction (LeWM-style, ramped in after the warmup).
+- **Prediction-gated reconstruction (`gate`)**: the real next frame is reconstructed again, each tile weighted by `exp(−e / τ)`, with `e` the tile's
+  per-pixel error of the decoded prediction. Tiles the predictor foresees are held; tiles it cannot foresee (noise) are not. τ is the detail level in
+  pixel error.
+
+| fresh decoder (real latent) | `fade-r0 + dp` | `+ tgt` | `gate` (τ 0.02) | `gate + tgt` (τ 0.02) | `gate + tgt` (τ 0.005) |
+|---|---|---|---|---|---|
+| agent position / facing | 1.00 / 0.57 | 1.00 / 0.95 | 1.00 / **0.99** | 1.00 / **1.00** | 1.00 / **0.99** |
+| hand / inventory / terrain | 0.99 / 0.99 / 0.82 | 0.99 / 0.99 / 0.80 | 0.99 / 0.99 / 0.82 | 0.98 / 0.99 / 0.82 | 0.99 / 0.99 / 0.82 |
+| mob (fresh / own decoder) | 0.55 / 0.71 | 0.29 / 0.65 | 0.27 / 0.37 | 0.30 / 0.53 | 0.33 / 0.60 |
+| twinkle (noise) | −0.02 | −0.02 | 0.20 | **−0.01** | **−0.01** |
+| predicted facing (move) / hand / mob | 0.97 / 0.62 / 0.62 | 0.99 / 0.53 / 0.56 | 0.93 / 0.61 / 0.48 | 0.99 / 0.52 / 0.42 | 0.99 / 0.52 / 0.49 |
+| latent rank | 104 | 101 | 104 | 101 | 101 |
+
+- **The gate restores the facing on its own** (0.57 → 0.99). It releases the noise only partly (0.20): the soft weight leaves the twinkle tiles about 15 %
+  of the pressure.
+- **`gate + tgt` holds all learned content and releases the noise completely**, with no rank collapse and dynamics close to the best. All pre-registered
+  drops of learned content (agent, inventory, facing) are 0.00 at τ 0.005.
+- **The mechanism changes as intended.** With the gate or the target gradient, shuffling the context latents drops the no-op facing to chance (0.24–0.29):
+  the predictor now reads the facing from the latent because the latent holds it.
+- **The cost is a little dynamics** (predicted hand 0.52 against 0.62 without the hold) and an **unresolved mob** (below).
+
+## 7. The mob: the open item
+
+- **The fresh decoder reads the mob lower in every fork with a hold** (0.27–0.33 against 0.55), the own decoder does not (0.37–0.60 against 0.62).
+- **The mob is localised poorly by every model, the parent included.** A position readout (which tile shows the mob) gives 0.45 (own decoder) and 0.20
+  (fresh decoder) in the parent, 0.00 for the fresh decoder in the forks. The pixel scores above therefore overstate what is held, and the fresh-decoder
+  differences between forks are not trustworthy.
+- **What the forks do change:** the predictor learns the chase (predicted position after a step toward the agent: 0.00 in the parent, 0.31 with dp),
+  and the real-latent position after a random step falls (own decoder 0.47 → 0.20–0.22) while it stays after predictable steps. That fits a model
+  releasing the unpredictable part of the mob. Whether this is acceptable depends on the use: a random step is unpredictable when it happens but becomes
+  state for the next prediction.
+
+## 8. Instruments and pitfalls
+
+- **Probes under-read compressed latents.** The facing was read at ~0.1 by every probe while a decoder read 0.95. Content claims rest on decoders.
+- **The fresh decoder must use the model's own class weights** (`decoder_strength(matched=True)`). With the default cap of 30 it under-reads mob and terrain;
+  the earlier "the mob is never learned" was this artifact.
+- **The own decoder can stop reading the real latent** when it is trained only on predictions (reconstruction weight 0). Use it for the predicted
+  frame, the fresh decoder for the real latent.
+- **Pixel scores mix placement and sharpness.** Position readouts (agent, mob) separate them.
+- **Variance shares** of the noise were 0.00 in every run, the parent included, so they carry no information here.
+- **Latent prediction error** is dominated by slow content in the joint model (copy-last error / variance 0.01) and is no progress measure.
+
+## 9. What we now believe
 
 | earlier | now |
 |---|---|
-| the facing is absent from the shadow and creeps in slowly | it is present (decoder 0.93–0.95 by 12k) and the probes under-read it |
-| plain B is settled by 15k and keeps the hand | it loses the hand at about 55k, when the retention weights decay |
-| the weighted hand loss is a quirk of the class weights | the same release mechanism, just earlier |
-| noise gets worse with training | twinkle peaks at about 40k, then decays |
-| the live rank collapses because SIGReg at 0.01 is too weak | the open target path collapses it; SIGReg 0.01 keeps full rank without it |
-| the open path removes noise | retention release removes noise; the open path does not |
-| a decoded prediction loss is the fix for dynamics | it helped a pretrained predictor; from scratch the residual predictor with latent loss did better; nothing got close. In the joint model's forks it is the largest gain: predicted move-step facing 0.83 → 0.95, hand 0.42 → 0.63, mob 0.32 → 0.54 (§8c) |
-| the live encoder does not earn its cost | its latent is about 5× more predictable, a geometry the dynamics need |
-| κ ≈ 1.5 is universal | κ is model-dependent (about 0.56 for `ae` at D 32) |
-| crops raise a class's mass | spatial crops do not raise the mass of uniformly spread classes |
+| JEPAs lose content because prediction prunes it | first, content never becomes available (pixel mass, location); pruning comes second |
+| a shadow encoder can protect what the live encoder needs | not with a release rule based on current predictability (§3) |
+| the facing is absent from reconstruction latents | it is there; probes missed it |
+| fading the reconstruction releases noise | it erodes everything; the decoded prediction makes the fade selective (§5) |
+| the decoded prediction holds what the predictor learned | it holds the output; action-determined content needs a hold on the real latent (§6) |
+| a target gradient collapses the rank | that was the gated open path; ungated, after the warmup and with the decoded prediction, the rank holds (101) |
+| the mob is lost by the fade | the plain fade loses it; dp keeps its pixel score, but no model localises it well (§7) |
 
-## 10. What this means for the architecture
+**The recipe this points to** (single seed): a joint encoder warmed up with class-balanced reconstruction, latent prediction and SIGReg
+(availability); then the content-agnostic reconstruction is switched off and replaced by the decoded prediction, a prediction-gated reconstruction of the
+real frame and a target gradient (judgement and consolidation). It holds what the predictor learned, releases what it could not and stays predictable.
 
-**The flaw in B's design.** The reference map releases a direction when the shadow predictor cannot predict it. That cannot separate "not
-learned yet" from "unlearnable", and hard but real content (the hand) is released like noise. Prediction then erodes it. Every tuning only moves
-a fragile force balance: lags, floors, weights, the open path.
+## 10. Open questions, in order
 
-**Two properties, split across two encoders.** The shadow (reconstruction) **keeps the content**. The live encoder (prediction) **makes the
-latent predictable**. B joins them only by a linear readout, so neither latent has both.
-
-**The recipe these results point to:**
-1. **One encoder with reconstruction + prediction + SIGReg** (the `joint` arm, `07_joint.ipynb`). Reconstruction keeps the content and
-   prediction shapes it for dynamics.
-2. **Balanced reconstruction without suppressing what the dynamics need.** A softer weight cap, so terrain stays (the hand depends on it), and
-   label-free weights (clusters with position types) once validated.
-3. **A noise criterion based on independence, not on today's predictor skill.** A direction is noise if it is independent of past frames and
-   actions, judged by a strong estimator trained long. Lag-1 autocorrelation is the linear special case. Noise that persists over time can't
-   be told apart from signal without a task.
-4. **A predictor able to learn action effects.** Residual, with the action multiplying the hidden state (FiLM), at least.
-5. **Mob handling.** The small, moving, rare entity is the Craftax failure that motivated all this, and **nothing here encodes it**, not even
-   the shadow. Candidates: weights from temporal change, patch- or object-level decoders, a much softer cap.
-6. **Decoder-based evaluation.** Probes are only a lower bound.
-
-## 11. Open questions, in order
-
-1. **The fresh decoder on the 08 forks** (parent, `fade`, `fade + dp`, `fade-r0 + dp`): is facing / agent in the latent after the strict fade (§8c, 3)? Then the target-gradient fork
-   (`fade-r0 + dp + tgt`, E1-E3 in the notebook) and a second seed.
-2. **Terrain and mob in the latent:** an unweighted decoder readout, and a softer class-weight cap.
-3. **An independence-based noise criterion** against the current release rule.
-4. **Seeds.** Above all the floor-and-open-path interaction and the joint arm.
-5. **Why release came at 5k (weighted) but 55k (plain).** Needs the per-group retention logs in a plain run.
-6. **Transfer to Craftax.** There, A5 (no prediction loss) lost mobs and ore just like B2/V3, so prediction was not the cause; pixel mass
-   (see AAC `reports/pixel_mass`) and availability are.
-
-## 12. Instruments and pitfalls
-
-- **Probes:** eval-time probes (`ev_pm_*`, 12k clips, 1000 steps) under-read the final probe (20k clips, 2000 steps), which under-reads a
-  decoder. Use decoders for content (`readout.decoder_strength`) and decoded predicted frames for dynamics (`readout.dynamics`).
-- **Facing** is readable by a decoder long before any probe; a position-conditioned code is not the explanation.
-- **Mechanism logs** (`log_mech`): per-term gradient norms and cosines, first-order attribution per part, per-group retention weights
-  (`ref_w_<group>`), the share of each group the gate protects (`S_frac_<group>`), spectra, retention-head fit. Checkpoints (`ckpt_every`) let
-  any question be asked of the weights later (rescue tests, decoders, predictor forks).
-- **Several runs on one GPU:** final probes used to render tens of thousands of clips at once and ran out of memory with five workers. Sampling
-  is now chunked (`probes.collect_last`), and `analysis.finalize` rebuilds the summary of a run that died there.
-- **Background runs:** `analysis.launch` (safe to re-run; skips finished and running runs), `progress`, `live_probes` (stops for dead runs).
+1. **The mob.** A reliable instrument (a position readout with a decoder that weights the mob), then whether availability of a small moving entity is
+   the limit. This is the Craftax failure that motivated the work.
+2. **Seeds** for `gate + tgt` and the key contrasts (`fade`, `fade-r0 + dp`).
+3. **Capacity.** At D = 128 the latent has spare room (rank ~100 of 128), so releasing noise has no measured benefit. A small-D comparison would show
+   whether release matters.
+4. **Label-free weights** in the joint model; the current weights use ground-truth tile classes.
+5. **How long availability must last.** Forks switched at 20k; earlier switches or `dp only` from scratch are untested.
+6. **Transfer to Craftax.**
 
 ## Where things are
 
 | what | where |
 |---|---|
-| env knobs | `gaf/env_grid.py`: `agent_shape`, `mob_mode`, `n_mobs`, `mob_chase`, `hand_tiles`, `hand_contrast`, `hand_p`, `compass_tiles`, `variants()` |
-| class weights | `train.class_weights`, `cluster_classes`, `rec_error` (`rec_class_power`, `rec_clusters`, `rec_pos_types`) |
-| retention options | `retain.RefMap` (`ret_floor_all`, `ret_w_min`, `ret_ac`) |
-| predictors | `models.Predictor`, `models.FiLMPredictor` (`pred_arch`) |
-| notebooks | `notebooks/` (numbered in order: `04_mass_law` … `08_joint_dp`); results in `results/<notebook name>/` |
-| method description | `docs/reference_gated_retention.md` |
+| world | `gaf/env_grid.py` (`agent_shape`, `mob_mode`, `mob_chase`, `hand_tiles`, `variants()`) |
+| objectives | `gaf/train.py` (arms, `rec_class_power`, `rec_class_cap`, `dp_weight`), `gaf/fork.py` (`dp`, `tgt`, `gate`, `r_floor`) |
+| readouts | `gaf/readout.py`: `dynamics`, `decoder_strength(matched=True)`, `action_test`, `variance_shares` |
+| notebooks | `notebooks/01`–`08`, numbered in order; the joint model and its forks are `07_joint`, `08_joint_dp` |
+| results | `results/<notebook>/`; `results/joint_dp/` holds every fork's checkpoint, `readouts.json`, and the saved tables (`readouts_all.csv`, `gate_readouts.csv`, `action_test.csv`, `mob_position.csv`) |
+| earlier method | `docs/reference_gated_retention.md` (B) |
