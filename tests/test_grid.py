@@ -605,3 +605,18 @@ def test_fork_without_weights_and_sigreg_override(tmp_path):
     s = json.loads((d / "forks" / "fade-nw" / "summary.json").read_text())["fork"]
     assert s["weights"] is False
     assert s["lam"] == 0.0
+
+
+def test_joint_parent_with_target_gradient(tmp_path):
+    """tgt_w > 0 turns the target gradient on in the joint parent (reconstruction stays); 0 is the old arm, with the old run id."""
+    import pandas as pd
+    env = GridCfg(W=8, H=6, n_slow=8, agent_shape="arrow", mob_mode="chase")
+    base = dict(arm="joint", env=env, D=8, steps=10, batch=16, floor_start=10 ** 9, eval_every=5, diag_every=5, probe_n=64, mlp_n=128,
+                mlp_steps=3, lam=0.01, pred_arch="film", ckpt_every=10)
+    assert Cfg(**base).run_id == Cfg(**base, tgt_w=0.0).run_id != Cfg(**base, tgt_w=1.0).run_id
+    res = {}
+    for name, kw in (("off", {}), ("on", dict(tgt_w=1.0))):
+        cfg = Cfg(**base, **kw)
+        run(cfg, tmp_path, verbose=False)
+        res[name] = pd.read_csv(tmp_path / cfg.run_id / "metrics.csv")["pred_mse"].iloc[-1] if "pred_mse" in pd.read_csv(tmp_path / cfg.run_id / "metrics.csv") else None
+    assert res["on"] != res["off"]  # the target gradient changes training
